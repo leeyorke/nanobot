@@ -20,19 +20,26 @@ _STRIP_SKILL_FRONTMATTER = re.compile(
 
 class SkillsLoader:
     """
-    Loader for agent skills.
+    Loader for agent capabilities.
 
     Skills are markdown files (SKILL.md) that teach the agent how to use
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None, disabled_skills: set[str] | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        disabled_skills: set[str] | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self.disabled_skills = disabled_skills or set()
 
-    def _skill_entries_from_dir(self, base: Path, source: str, *, skip_names: set[str] | None = None) -> list[dict[str, str]]:
+    def _skill_entries_from_dir(
+        self, base: Path, source: str, *, skip_names: set[str] | None = None
+    ) -> list[dict[str, str]]:
         if not base.exists():
             return []
         entries: list[dict[str, str]] = []
@@ -62,17 +69,23 @@ class SkillsLoader:
         workspace_names = {entry["name"] for entry in skills}
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
-                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)
+                self._skill_entries_from_dir(
+                    self.builtin_skills, "builtin", skip_names=workspace_names
+                )
             )
 
         if self.disabled_skills:
             skills = [s for s in skills if s["name"] not in self.disabled_skills]
 
         if filter_unavailable:
-            return [skill for skill in skills if self._check_requirements(self._get_skill_meta(skill["name"]))]
+            return [
+                skill
+                for skill in skills
+                if self._check_requirements(self._get_skill_meta(skill["name"]))
+            ]
         return skills
 
-    def load_skill(self, name: str) -> str | None:
+    def load_skill(self, name: str) -> Optional[str]:
         """
         Load a skill by name.
 
@@ -147,7 +160,11 @@ class SkillsLoader:
         required_bins = requires.get("bins", [])
         required_env_vars = requires.get("env", [])
         return ", ".join(
-            [f"CLI: {command_name}" for command_name in required_bins if not shutil.which(command_name)]
+            [
+                f"CLI: {command_name}"
+                for command_name in required_bins
+                if not shutil.which(command_name)
+            ]
             + [f"ENV: {env_name}" for env_name in required_env_vars if not os.environ.get(env_name)]
         )
 
@@ -170,7 +187,7 @@ class SkillsLoader:
         }
 
     def _get_skill_description(self, name: str) -> str:
-        """Get the description of a skill from its frontmatter."""
+        """Get description of a skill from its frontmatter."""
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
             return meta["description"]
@@ -182,7 +199,7 @@ class SkillsLoader:
             return content
         match = _STRIP_SKILL_FRONTMATTER.match(content)
         if match:
-            return content[match.end():].strip()
+            return content[match.end() :].strip()
         return content
 
     def _parse_nanobot_metadata(self, raw: object) -> dict:
@@ -230,7 +247,7 @@ class SkillsLoader:
             )
         ]
 
-    def get_skill_metadata(self, name: str) -> dict | None:
+    def get_skill_metadata(self, name: str) -> Optional[dict]:
         """
         Get metadata from a skill's frontmatter.
 

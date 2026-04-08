@@ -228,7 +228,9 @@ class AgentLoop:
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
-        self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
+        self._default_selection_signature = preset_helpers.default_selection_signature(
+            provider_signature
+        )
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
@@ -247,7 +249,8 @@ class AgentLoop:
         )
         self.provider_retry_mode = provider_retry_mode
         self.tool_hint_max_length = (
-            tool_hint_max_length if tool_hint_max_length is not None
+            tool_hint_max_length
+            if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
         self.tools_config = _tc
@@ -361,9 +364,13 @@ class AgentLoop:
         provider = extra.pop("provider", None) or make_provider(config)
         resolved = config.resolve_preset()
         model = extra.pop("model", None) or resolved.model
-        context_window_tokens = extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        context_window_tokens = (
+            extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        )
         provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
-        preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
+        preset_snapshot_loader = extra.pop(
+            "preset_snapshot_loader", None
+        ) or preset_helpers.make_preset_snapshot_loader(
             config,
             provider_snapshot_loader,
         )
@@ -452,7 +459,9 @@ class AgentLoop:
             self._default_selection_signature = default_selection
         if snapshot.signature == self._provider_signature:
             return
-        self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
+        self._default_selection_signature = preset_helpers.default_selection_signature(
+            snapshot.signature
+        )
         self._apply_provider_snapshot(snapshot)
 
     @property
@@ -513,8 +522,11 @@ class AgentLoop:
         await agent_context.connect_mcp(self, self.tools)
 
     def _set_tool_context(
-        self, channel: str, chat_id: str,
-        message_id: str | None = None, metadata: dict | None = None,
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict | None = None,
         session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
@@ -592,7 +604,9 @@ class AgentLoop:
         media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(msg.content, str) and msg.content.strip()
         if has_text or media_paths:
-            extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
+            extra: dict[str, Any] = (
+                {"media": list(media_paths)} if media_paths else {}
+            ) | agent_context.session_extra(msg.metadata)
             extra.update(kwargs)
             text = msg.content if isinstance(msg.content, str) else ""
             text_override, cron_extra = cron_history_overrides(msg.metadata)
@@ -763,9 +777,11 @@ class AgentLoop:
             # Block if nothing drained but sub-agents spawned in this dispatch
             # are still running.  Keeps the runner loop alive so subsequent
             # completions are injected in-order rather than dispatched separately.
-            if (not items
-                    and session is not None
-                    and self.subagents.get_running_count_by_session(session.key) > 0):
+            if (
+                not items
+                and session is not None
+                and self.subagents.get_running_count_by_session(session.key) > 0
+            ):
                 try:
                     msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
                 except asyncio.TimeoutError:
@@ -813,41 +829,45 @@ class AgentLoop:
 
         session_metadata = session.metadata if session is not None else None
         try:
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=initial_messages,
-                tools=tools or self.tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                hook=hook,
-                error_message="Sorry, I encountered an error calling the AI model.",
-                concurrent_tools=True,
-                workspace=effective_scope.project_path,
-                session_key=session.key if session else None,
-                context_window_tokens=self.context_window_tokens,
-                context_block_limit=self.context_block_limit,
-                provider_retry_mode=self.provider_retry_mode,
-                progress_callback=on_progress,
-                stream_progress_deltas=on_stream is not None,
-                retry_wait_callback=on_retry_wait,
-                checkpoint_callback=_checkpoint,
-                injection_callback=_drain_pending,
-                # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
-                # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
-                llm_timeout_s=runner_wall_llm_timeout_s(
-                    self.sessions,
-                    session.key if session is not None else session_key,
-                    metadata=session_metadata,
-                    message_metadata=metadata,
-                ),
-                goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
-                goal_continue_message=_goal_continue,
-                finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
-                    pending_queue_available=pending_queue is not None and session is not None,
-                    session_metadata=session_metadata,
-                    message_metadata=metadata,
-                ),
-            ))
+            result = await self.runner.run(
+                AgentRunSpec(
+                    initial_messages=initial_messages,
+                    tools=tools or self.tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    hook=hook,
+                    error_message="Sorry, I encountered an error calling the AI model.",
+                    concurrent_tools=True,
+                    workspace=effective_scope.project_path,
+                    session_key=session.key if session else None,
+                    context_window_tokens=self.context_window_tokens,
+                    context_block_limit=self.context_block_limit,
+                    provider_retry_mode=self.provider_retry_mode,
+                    progress_callback=on_progress,
+                    stream_progress_deltas=on_stream is not None,
+                    retry_wait_callback=on_retry_wait,
+                    checkpoint_callback=_checkpoint,
+                    injection_callback=_drain_pending,
+                    # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
+                    # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
+                    llm_timeout_s=runner_wall_llm_timeout_s(
+                        self.sessions,
+                        session.key if session is not None else session_key,
+                        metadata=session_metadata,
+                        message_metadata=metadata,
+                    ),
+                    goal_active_predicate=lambda: sustained_goal_active(session.metadata)
+                    if session is not None
+                    else False,
+                    goal_continue_message=_goal_continue,
+                    finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
+                        pending_queue_available=pending_queue is not None and session is not None,
+                        session_metadata=session_metadata,
+                        message_metadata=metadata,
+                    ),
+                )
+            )
         finally:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
@@ -868,7 +888,13 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+        return (
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            result.had_injections,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -990,11 +1016,14 @@ class AgentLoop:
                             meta = dict(msg.metadata or {})
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta,
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata=meta,
+                                )
+                            )
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
@@ -1002,15 +1031,20 @@ class AgentLoop:
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content="",
+                                    metadata=meta,
+                                )
+                            )
                             stream_segment += 1
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
                     completed_channel = msg.channel
@@ -1020,10 +1054,14 @@ class AgentLoop:
                         completed_channel = response.channel
                         completed_chat_id = response.chat_id
                     elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=msg.metadata or {},
+                            )
+                        )
                     continuing = turn_continuation.internal_continuation_pending(msg.metadata)
                     if not continuing:
                         await self._runtime_events().turn_completed(
@@ -1065,10 +1103,13 @@ class AgentLoop:
                     raise
                 except Exception as exc:
                     logger.exception("Error processing message for session {}", session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        )
+                    )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
                         await self._runtime_events().turn_completed(
                             channel=msg.channel,
@@ -1100,19 +1141,16 @@ class AgentLoop:
                         if leftover:
                             logger.info(
                                 "Re-published {} leftover message(s) to bus for session {}",
-                                leftover, session_key,
+                                leftover,
+                                session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        await self._runtime_events().run_status_changed(
-                            msg, session_key, "idle"
-                        )
+                        await self._runtime_events().run_status_changed(msg, session_key, "idle")
                         self._runtime_events().clear_turn(session_key)
                     await self._cron_turns.publish_next_deferred(session_key)
         finally:
             if pending is None:
-                await self._runtime_events().run_status_changed(
-                    msg, session_key, "idle"
-                )
+                await self._runtime_events().run_status_changed(msg, session_key, "idle")
                 self._runtime_events().clear_turn(session_key)
                 await self._cron_turns.publish_next_deferred(session_key)
 
@@ -1149,9 +1187,7 @@ class AgentLoop:
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
         """Process a system inbound message (e.g. subagent announce)."""
-        channel, chat_id = (
-            msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
-        )
+        channel, chat_id = msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
         logger.info("Processing system message from {}", msg.sender_id)
         key = msg.session_key_override or f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(key)
@@ -1173,8 +1209,11 @@ class AgentLoop:
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
         self._set_tool_context(
-            channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            channel,
+            chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata,
+            session_key=key,
         )
         current_role = "assistant" if is_subagent else "user"
         _hist_kwargs: dict[str, Any] = {
@@ -1204,7 +1243,10 @@ class AgentLoop:
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
-            messages, session=session, channel=channel, chat_id=chat_id,
+            messages,
+            session=session,
+            channel=channel,
+            chat_id=chat_id,
             message_id=msg.metadata.get("message_id"),
             metadata=msg.metadata,
             session_key=key,
@@ -1328,8 +1370,7 @@ class AgentLoop:
             next_state = self._TRANSITIONS.get((ctx.state, event))
             if next_state is None:
                 raise RuntimeError(
-                    f"[turn {ctx.turn_id}] No transition from {ctx.state} "
-                    f"on event {event!r}"
+                    f"[turn {ctx.turn_id}] No transition from {ctx.state} on event {event!r}"
                 )
             ctx.state = next_state
 
@@ -1431,9 +1472,7 @@ class AgentLoop:
                 ctx.user_persisted_early = self._persist_user_message_early(
                     ctx.msg, ctx.session, _command=True
                 )
-                ctx.session.add_message(
-                    "assistant", result.content, _command=True
-                )
+                ctx.session.add_message("assistant", result.content, _command=True)
                 self.sessions.save(ctx.session)
                 self._clear_pending_user_turn(ctx.session)
             return "shortcut"
@@ -1475,9 +1514,7 @@ class AgentLoop:
             ctx.pending_summary,
             include_memory_recent_history=not ctx.ephemeral,
         )
-        ctx.user_persisted_early = self._persist_user_message_early(
-            ctx.msg, ctx.session
-        )
+        ctx.user_persisted_early = self._persist_user_message_early(ctx.msg, ctx.session)
 
         if ctx.on_progress is None:
             ctx.on_progress = await self._build_bus_progress_callback(ctx.msg)
@@ -1526,9 +1563,8 @@ class AgentLoop:
         turn_continuation.prepare_save_boundary(ctx)
 
         if (
-            (ctx.final_content is None or not ctx.final_content.strip())
-            and not ctx.suppress_response
-        ):
+            ctx.final_content is None or not ctx.final_content.strip()
+        ) and not ctx.suppress_response:
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         latency_started_at = (
@@ -1539,7 +1575,9 @@ class AgentLoop:
         )
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
         self._save_turn(
-            ctx.session, ctx.all_messages, ctx.save_skip,
+            ctx.session,
+            ctx.all_messages,
+            ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
         )
         self._runtime_events().record_turn_latency(
