@@ -4,7 +4,7 @@
 """
 import json
 from datetime import datetime, timezone, timedelta
-from .helpers import get_timezone
+from .helpers import get_timezone, parse_frontmatter
 from pathlib import Path
 from jinja2 import Template
 from .inbox_operations import InboxOperations
@@ -346,14 +346,7 @@ class ReviewReminder:
             for md_file in dir_path.glob('*.md'):
                 try:
                     content = md_file.read_text(encoding='utf-8')
-                    if content.startswith('---'):
-                        parts = content.split('---', 2)
-                        if len(parts) >= 3:
-                            frontmatter = yaml.safe_load(parts[1])
-                        else:
-                            frontmatter = {}
-                    else:
-                        frontmatter = {}
+                    frontmatter, _ = parse_frontmatter(content)
 
                     content = self.todo_generator._extract_task_content(content)
                     long_term_tasks.append({

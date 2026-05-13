@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import yaml
+from .scripts.helpers import parse_frontmatter, dump_frontmatter
 
 TZ = timezone(timedelta(hours=8))
 
@@ -64,7 +64,7 @@ def _first_run_check(config):
     """检查是否初次运行，若是则提示用户配置 data_dir。"""
 
     def is_directory_empty(path):
-        directory = Path(path)
+        directory = Path(path).expanduser().resolve()
         if not directory.exists():
             return True
         if not directory.is_dir():
@@ -190,20 +190,13 @@ def cmd_done(args):
     target = _inbox_ops.move_record(task["path"], "02-Tasks/Completed")
 
     text = target.read_text(encoding="utf-8")
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        fm = yaml.safe_load(parts[1]) or {}
-        body = parts[2]
-    else:
-        fm = {}
-        body = text
+    fm, body = parse_frontmatter(text)
 
     fm["status"] = "completed"
     fm["completed_at"] = datetime.now(TZ).isoformat()
     body = body.replace("- [ ]", "- [x]", 1)
 
-    yaml_content = yaml.dump(fm, allow_unicode=True, sort_keys=False)
-    target.write_text(f"---\n{yaml_content}---\n{body}", encoding="utf-8")
+    target.write_text(dump_frontmatter(fm, body), encoding="utf-8")
 
     _gtd_classifier.update_kanban()
     print(f"✅ 已完成：{task['content'][:50]}")
@@ -303,13 +296,7 @@ def _list_dir(dir_path: Path, limit: int = 20):
     for f in files:
         try:
             text = f.read_text(encoding="utf-8")
-            if text.startswith("---"):
-                parts = text.split("---", 2)
-                fm = yaml.safe_load(parts[1]) or {} if len(parts) >= 2 else {}
-                body = parts[2] if len(parts) >= 3 else ""
-            else:
-                fm = {}
-                body = text
+            fm, body = parse_frontmatter(text)
             preview = body.split("\n")[0].strip().lstrip("#").strip()[:40]
             ts = datetime.fromtimestamp(f.stat().st_mtime, tz=TZ).strftime("%m-%d %H:%M")
             status = fm.get("status", "")

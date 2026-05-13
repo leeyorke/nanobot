@@ -146,9 +146,6 @@ class ContentClassifier:
         now = datetime.now(self._tz)
         content_lower = content.lower()
 
-        # 匹配时间模式
-        patterns = self.rules.get('time_patterns', [])
-
         # 1. 匹配 "明天下午3点" 这种格式
         match = re.search(r"明天\s*(上午|下午|晚上|凌晨)?\s*(\d{1,2})?[:点]?(\d{1,2})?", content_lower)
         if match:

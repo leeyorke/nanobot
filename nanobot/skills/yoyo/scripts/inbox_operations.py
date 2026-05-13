@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import yaml
-from .helpers import get_data_dir, get_timezone, PersonalSecretaryError, FileOperationError
+from .helpers import get_data_dir, get_timezone, PersonalSecretaryError, FileOperationError, parse_frontmatter
 
 # 时区（从配置获取）
 TZ = None  # 延迟到第一次使用时获取
@@ -315,17 +315,7 @@ kanban-plugin: basic
                     content = md_file.read_text(encoding='utf-8')
 
                     # 解析YAML frontmatter
-                    if content.startswith('---'):
-                        parts = content.split('---', 2)
-                        if len(parts) >= 3:
-                            frontmatter = yaml.safe_load(parts[1])
-                            body = parts[2].strip()
-                        else:
-                            frontmatter = {}
-                            body = content
-                    else:
-                        frontmatter = {}
-                        body = content
+                    frontmatter, body = parse_frontmatter(content)
 
                     # 过滤条件
                     match = True
@@ -383,7 +373,9 @@ kanban-plugin: basic
         return records
 
     def move_record(self, record_path, target_dir):
-        """移动记录到目标目录"""
+        """移动记录到目标目录（支持跨文件系统）"""
+        import shutil
+
         source_path = Path(record_path)
         target_dir = self.data_dir / target_dir
 
@@ -393,7 +385,10 @@ kanban-plugin: basic
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / source_path.name
 
-        # 移动文件
-        source_path.rename(target_path)
+        # 优先 rename（同文件系统原子操作），失败则 fallback 到 shutil.move
+        try:
+            source_path.rename(target_path)
+        except OSError:
+            shutil.move(str(source_path), str(target_path))
 
         return target_path

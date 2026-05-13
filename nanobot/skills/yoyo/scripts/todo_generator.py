@@ -3,11 +3,11 @@
 待办生成和提醒模块：动态检查待办到期时间，发送提醒通知
 """
 import re
-import yaml
 from datetime import datetime, timezone, timedelta
-from .helpers import get_timezone
+from .helpers import get_timezone, parse_frontmatter, dump_frontmatter
 from pathlib import Path
 from .inbox_operations import InboxOperations
+from .habit_tracker import HabitTracker
 
 # 北京时间时区
 
@@ -19,6 +19,7 @@ class TodoGenerator:
         """
         self.inbox_ops = InboxOperations(config)
         self.data_dir = self.inbox_ops.data_dir
+        self.habit_tracker = HabitTracker(self.data_dir)
 
     def get_upcoming_tasks(self, time_window_minutes=60):
         """
@@ -41,17 +42,8 @@ class TodoGenerator:
             for md_file in dir_path.glob('*.md'):
                 try:
                     content = md_file.read_text(encoding='utf-8')
-                    if content.startswith('---'):
-                        parts = content.split('---', 2)
-                        if len(parts) >= 3:
-                            frontmatter = yaml.safe_load(parts[1])
-                            body = parts[2].strip()
-                        else:
-                            frontmatter = {}
-                            body = content
-                    else:
-                        frontmatter = {}
-                        body = content
+                    frontmatter, body = parse_frontmatter(content)
+                    body = body.strip()
 
                     # 只处理有截止时间的任务
                     due_date_str = frontmatter.get('due_date')
@@ -119,31 +111,44 @@ class TodoGenerator:
 
         try:
             content = file_path.read_text(encoding='utf-8')
-            if content.startswith('---'):
-                parts = content.split('---', 2)
-                if len(parts) >= 3:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    body = parts[2]
-                else:
-                    frontmatter = {}
-                    body = content
-            else:
-                frontmatter = {}
-                body = content
+            frontmatter, body = parse_frontmatter(content)
 
             # 更新frontmatter
             frontmatter['reminded'] = True
             frontmatter['reminded_at'] = datetime.now(TZ).isoformat()
 
             # 重新写入文件
-            yaml_content = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-            new_content = f"---\n{yaml_content}---\n{body}"
-            file_path.write_text(new_content, encoding='utf-8')
+            file_path.write_text(dump_frontmatter(frontmatter, body), encoding='utf-8')
 
             return True
         except Exception as e:
             print(f"标记任务提醒失败 {task_file_path}: {e}")
             return False
+
+    def get_habit_definitions(self):
+        """从 habits.md 获取所有习惯名称"""
+        habits_file = self.data_dir / '04-Events' / 'habits.md'
+        if not habits_file.exists():
+            return []
+
+        content = habits_file.read_text(encoding='utf-8')
+        habits = []
+        for line in content.split('\n'):
+            m = re.match(r'^-\s*\[\s*\]\s+(.+)', line.strip())
+            if not m:
+                m = re.match(r'^-\s*\[x\]\s+(.+)', line.strip())
+            if m:
+                name = m.group(1).strip()
+                if name:
+                    habits.append(name)
+        return habits
+
+    def get_unchecked_habits(self):
+        """查询 SQLite：今天还没打卡的习惯"""
+        today = datetime.now(TZ).strftime('%Y-%m-%d')
+        done_set = self.habit_tracker.get_done_today(today)
+        all_habits = self.get_habit_definitions()
+        return [h for h in all_habits if h not in done_set]
 
     def generate_reminder_message(self, task):
         """生成提醒消息"""
@@ -249,6 +254,17 @@ class TodoGenerator:
             message += "🎉 今天没有待办任务，好好享受一天吧！\n"
         else:
             message += f"💪 今日共有 {total_count} 个待办任务，加油！\n"
+
+        # 今日习惯清单（从 SQLite 查状态，habits.md 只提供名称）
+        habits = self.get_habit_definitions()
+        if habits:
+            today_s = now.strftime('%Y-%m-%d')
+            done_set = self.habit_tracker.get_done_today(today_s)
+            message += f"\n🎯 今日习惯（共{len(habits)}个）：\n"
+            for h in habits:
+                status = 'x' if h in done_set else ' '
+                message += f"- [{status}] {h}\n"
+            message += "\n"
 
         # 添加每日寄语
         hello_file = self.data_dir / '04-Events' / 'hello.md'

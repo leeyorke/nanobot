@@ -4,6 +4,9 @@ yoyo技能通用工具函数
 """
 from pathlib import Path
 from datetime import timezone, timedelta
+from typing import Tuple
+
+import yaml
 
 
 def get_config_value(config, key_path, default=None):
@@ -101,3 +104,46 @@ class FileOperationError(PersonalSecretaryError):
 class ValidationError(PersonalSecretaryError):
     """数据验证异常"""
     pass
+
+
+def parse_frontmatter(content: str) -> Tuple[dict, str]:
+    """
+    解析 Markdown 文件的 YAML frontmatter
+
+    Args:
+        content: Markdown 文件原始内容
+
+    Returns:
+        (frontmatter_dict, body_str) 元组。
+        frontmatter 始终为 dict（解析失败为空 dict），
+        body 为 frontmatter 之后的内容（未 strip，保留原格式）
+    """
+    if not content.startswith('---'):
+        return {}, content
+
+    parts = content.split('---', 2)
+    if len(parts) < 3:
+        return {}, content
+
+    try:
+        frontmatter = yaml.safe_load(parts[1]) or {}
+    except Exception:
+        frontmatter = {}
+    body = parts[2]
+
+    return frontmatter, body
+
+
+def dump_frontmatter(frontmatter: dict, body: str) -> str:
+    """
+    将 frontmatter dict + body 序列化为带 YAML header 的 Markdown
+
+    Args:
+        frontmatter: 元数据字典
+        body: 正文内容
+
+    Returns:
+        完整的 Markdown 内容（含 frontmatter）
+    """
+    yaml_content = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
+    return f"---\n{yaml_content}---\n{body}"

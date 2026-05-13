@@ -5,7 +5,7 @@ GTD分类模块：对待办事项进行GTD分类，自动更新Kanban文件
 import json
 import re
 from datetime import datetime, timezone, timedelta
-from .helpers import get_timezone
+from .helpers import get_timezone, parse_frontmatter
 from pathlib import Path
 import yaml
 from .inbox_operations import InboxOperations
@@ -108,17 +108,8 @@ class GTDClassifier:
             try:
                 # 读取记录
                 content = md_file.read_text(encoding='utf-8')
-                if content.startswith('---'):
-                    parts = content.split('---', 2)
-                    if len(parts) >= 3:
-                        frontmatter = yaml.safe_load(parts[1])
-                        body = parts[2].strip()
-                    else:
-                        frontmatter = {}
-                        body = content
-                else:
-                    frontmatter = {}
-                    body = content
+                frontmatter, body = parse_frontmatter(content)
+                body = body.strip()
 
                 todo_record = {
                     'path': str(md_file),
@@ -206,17 +197,8 @@ class GTDClassifier:
                 for md_file in dir_path.glob('*.md'):
                     try:
                         file_content = md_file.read_text(encoding='utf-8')
-                        if file_content.startswith('---'):
-                            parts = file_content.split('---', 2)
-                            if len(parts) >= 3:
-                                frontmatter_task = yaml.safe_load(parts[1])
-                                task_body = parts[2].strip()
-                            else:
-                                frontmatter_task = {}
-                                task_body = file_content
-                        else:
-                            frontmatter_task = {}
-                            task_body = file_content
+                        frontmatter_task, task_body = parse_frontmatter(file_content)
+                        task_body = task_body.strip()
 
                         # 提取任务内容（去掉标题，取第一个任务项）
                         task_lines = task_body.split('\n')
@@ -241,7 +223,7 @@ class GTDClassifier:
 
                         # 添加完成时间标记
                         if category == 'Completed':
-                            mtime = datetime.fromtimestamp(md_file.stat().st_mtime, TZ)
+                            mtime = datetime.fromtimestamp(md_file.stat().st_mtime, self._tz)
                             task_content = task_content.replace('- [ ]', '- [x]')
                             task_content += f" ✅ {mtime.strftime('%Y-%m-%d %H:%M')}"
 

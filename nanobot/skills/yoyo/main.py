@@ -3,13 +3,16 @@
 私人秘书技能主入口
 """
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
 from loguru import logger
 
 from .scripts.content_classifier import ContentClassifier
 from .scripts.gtd_classifier import GTDClassifier
+from .scripts.helpers import dump_frontmatter, parse_frontmatter
 from .scripts.inbox_operations import InboxOperations
 from .scripts.review_reminder import ReviewReminder
 from .scripts.todo_generator import TodoGenerator
@@ -23,22 +26,35 @@ content_classifier = None
 gtd_classifier = None
 todo_generator = None
 review_reminder = None
+_last_config = None
 
 
 def _init_instances(config):
-    """初始化所有实例"""
-    global inbox_ops, content_classifier, gtd_classifier, todo_generator, review_reminder
+    """初始化所有实例，支持 config 变化时自动重新初始化"""
+    global \
+        inbox_ops, \
+        content_classifier, \
+        gtd_classifier, \
+        todo_generator, \
+        review_reminder, \
+        _last_config
+
+    # config 对象变化时（多实例场景），强制重新初始化
+    if inbox_ops is not None and config is not _last_config:
+        inbox_ops = None
+
     if inbox_ops is None:
         inbox_ops = InboxOperations(config)
         content_classifier = ContentClassifier(inbox_ops.data_dir, config)
         gtd_classifier = GTDClassifier(inbox_ops.data_dir, config)
         todo_generator = TodoGenerator(inbox_ops.data_dir, config)
         review_reminder = ReviewReminder(inbox_ops.data_dir, config)
+        _last_config = config
 
 
 def first_check(context):
     def is_directory_empty(path):
-        directory = Path(path)
+        directory = Path(path).expanduser().resolve()
         if not directory.exists():
             return True
         if not directory.is_dir():
@@ -49,6 +65,7 @@ def first_check(context):
     config = context.get("config")
     if config is None:
         from nanobot.config.loader import load_config
+
         config = load_config()
         context["config"] = config  # 存回context供后续使用
 
@@ -73,6 +90,114 @@ def first_check(context):
         )
 
 
+async def _classify_intent(message: str, context: dict) -> dict:
+    """LLM 判断意图及提取参数，返回 dict {"intent": "...", ...}"""
+
+    try:
+        provider = context["loop"].provider
+        model = context["loop"].model
+    except (KeyError, AttributeError):
+        return {"intent": "ask_user"}
+
+    # 读取已定义的习惯名称，帮助 LLM 识别打卡
+    habit_names = ", ".join(todo_generator.get_habit_definitions()) if todo_generator else ""
+
+    prompt = f"""你是一个意图路由器，根据用户消息判断意图并提取参数。
+
+可用意图及对应参数：
+- record: 记录内容到收件箱。返回 content（用户要记的内容）。
+  例："记录明天下午3点开会" → {{"intent": "record", "content": "明天下午3点开会"}}
+- query_today: 查看今日待办。无额外参数。
+- search: 搜索历史。返回 query（搜索词）。
+  例："搜索上周的会议笔记" → {{"intent": "search", "query": "上周的会议笔记"}}
+- view_habits: 查看今日习惯完成情况。无额外参数。
+  例："我今天完成了哪些习惯"
+- record_habit: 添加新习惯。返回 habit（习惯名）。
+  例："养成每天跑步的习惯" → {{"intent": "record_habit", "habit": "每天跑步"}}
+- habit_checkin: 打卡完成习惯。返回 habits（习惯名列表，可多个）。
+  注意：habits 中的名称必须从"已定义的习惯"列表中选取，不能自己缩写。
+  例：如果已定义的习惯是["每天吃一个鸡蛋", "阅读"]，用户说"鸡蛋吃过了"→{{"intent": "habit_checkin", "habits": ["每天吃一个鸡蛋"]}}
+- habit_stats: 查看习惯统计。无额外参数。
+- mark_done: 标记任务完成。返回 tasks（任务关键词列表，可多个）。
+  例："完成了会议纪要" → {{"intent": "mark_done", "tasks": ["会议纪要"]}}
+  例："会议纪要、需求文档都搞定了" → {{"intent": "mark_done", "tasks": ["会议纪要", "需求文档"]}}
+- generate_report: 生成日报。无额外参数。
+- ask_user: 以上都不匹配时返回此值。
+
+已定义的习惯（必须使用这里面的完整名称）：{habit_names}
+
+用户消息：{message}
+
+返回纯 JSON，不要 markdown 包裹。"""
+
+    try:
+        response = await provider.chat(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0,
+            max_tokens=2048,
+        )
+        logger.debug(
+            f"[yoyo] LLM 原始响应: content={response.content!r}, finish_reason={response.finish_reason!r}"
+        )
+        text = (response.content or "").strip()
+        # 适配可能的 markdown 代码块
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(text)
+        intent = result.get("intent", "ask_user")
+        valid = {
+            "record",
+            "query_today",
+            "search",
+            "view_habits",
+            "record_habit",
+            "habit_checkin",
+            "habit_stats",
+            "mark_done",
+            "generate_report",
+            "ask_user",
+        }
+        if intent not in valid:
+            return {"intent": "ask_user"}
+
+        # 校验各意图的必填参数
+        if intent == "habit_checkin":
+            habits = result.get("habits", [])
+            if isinstance(habits, list) and habits:
+                return {"intent": "habit_checkin", "habits": habits}
+            return {"intent": "ask_user"}
+
+        if intent == "record":
+            content = (result.get("content") or "").strip()
+            if content:
+                return {"intent": "record", "content": content}
+            return {"intent": "ask_user"}
+
+        if intent == "search":
+            query = (result.get("query") or "").strip()
+            if query:
+                return {"intent": "search", "query": query}
+            return {"intent": "ask_user"}
+
+        if intent == "record_habit":
+            habit = (result.get("habit") or "").strip()
+            if habit:
+                return {"intent": "record_habit", "habit": habit}
+            return {"intent": "ask_user"}
+
+        if intent == "mark_done":
+            tasks = result.get("tasks", [])
+            if isinstance(tasks, list) and tasks:
+                return {"intent": "mark_done", "tasks": tasks}
+            return {"intent": "ask_user"}
+
+        return {"intent": intent}
+    except Exception as e:
+        logger.warning(f"[yoyo] LLM 意图分类失败: {e}")
+        return {"intent": "ask_user"}
+
+
 async def handle(message, context):
     """
     处理用户消息
@@ -85,7 +210,7 @@ async def handle(message, context):
     # first_check 会处理 config 加载并存入context
     hint = first_check(context)
     if hint:
-        logger.info(f"[yoyo] 返回初次配置提示")
+        logger.info("[yoyo] 返回初次配置提示")
         return hint
 
     # 从context获取config（first_check已加载并存入）
@@ -98,36 +223,23 @@ async def handle(message, context):
     msg_stripped = re.sub(r"^yoyo[，,\s]+", "", message_lower, flags=re.IGNORECASE)
     msg_original_stripped = re.sub(r"^yoyo[，,\s]+", "", message, flags=re.IGNORECASE)
 
-    # 1. 记录功能 - 多种自然表达方式
-    # 模式：关键字在任意位置 "保存到 inbox"、"记录"、"帮我把这个保存到 inbox" 等
-    # 注意：如果消息包含"习惯"相关关键词且"记一下"后面没有内容，优先走习惯处理
-    record_keywords = [
-        "保存到 inbox", "保存到inbox", "记录", "记下", "帮我记一下",
-        "我要记", "记一下", "记住", "帮我把这个保存到 inbox"
-    ]
-    content = None
-    is_habit_intent = "习惯" in msg_stripped or "养成" in msg_stripped
-    for kw in record_keywords:
-        if kw in msg_stripped:
-            # 找到关键字位置，内容 = 关键字之后的所有文字
-            idx = msg_stripped.find(kw) + len(kw)
-            after_keyword = msg_original_stripped[idx:].strip()
-            # 如果"记一下"后面没有内容，且包含习惯关键词，跳过记录走习惯处理
-            if not after_keyword and is_habit_intent:
-                break
-            content = after_keyword
-            break
+    # LLM 意图分类
+    result = await _classify_intent(message, context)
+    intent = result["intent"]
+    logger.info(f"[yoyo] 意图分类: {intent}")
 
-    if content:
+    # ---- record: 记录内容到收件箱 ----
+    if intent == "record":
+        content = result.get("content", msg_original_stripped.strip())
         if not content:
             logger.info("[yoyo] 记录内容为空，要求补充")
             return "请告诉我你要记录的内容哦😊"
 
-        # 分类内容
         classify_result = content_classifier.classify(content)
-        logger.info(f"[yoyo] 记录内容: type={classify_result['content_type']}, content={content[:30]}...")
+        logger.info(
+            f"[yoyo] 记录内容: type={classify_result['content_type']}, content={content[:30]}..."
+        )
 
-        # 添加到收件箱
         file_path = inbox_ops.add_record(
             content=content,
             content_type=classify_result["content_type"],
@@ -136,18 +248,14 @@ async def handle(message, context):
             tags=classify_result["tags"],
         )
 
-        response = f"✅ 已成功记录到收件箱！\n"
+        response = "✅ 已成功记录到收件箱！\n"
         response += f"📝 内容：{content[:50]}{'...' if len(content) > 50 else ''}\n"
         response += f"🏷️ 类型：{classify_result['content_type']} (置信度: {classify_result['confidence']:.2f})\n"
-
         if classify_result["due_date"]:
             response += f"⏰ 时间：{classify_result['due_date'].strftime('%Y-%m-%d %H:%M')}\n"
         if classify_result["tags"]:
             response += f"🔖 标签：{', '.join(classify_result['tags'])}\n"
-
         response += f"📂 文件路径：{file_path}"
-
-        # 如果是待办，移动到Pending目录待GTD分类
         if classify_result["content_type"] == "todo":
             inbox_ops.move_record(str(file_path), "02-Tasks/Pending")
             gtd_classifier.process_pending_todos()
@@ -156,180 +264,182 @@ async def handle(message, context):
         logger.info(f"[yoyo] 回复: {response[:80]}...")
         return response
 
-    # 2. 查询今日待办
-    if re.match(r"^(我的)?(今日|今天)(任务|待办|清单)", msg_stripped):
-        logger.info("[yoyo] 匹配到查询今日待办")
+    # ---- query_today: 查询今日待办 ----
+    if intent == "query_today":
+        logger.info("[yoyo] 查询今日待办")
         briefing = todo_generator.get_daily_morning_briefing()
         return briefing
 
-    # 3. 查询历史记录
-    search_keywords = ["搜索", "查询", "找"]
-    for kw in search_keywords:
-        if kw in msg_stripped:
-            # 内容 = 关键字之后的所有文字
-            idx = msg_stripped.find(kw) + len(kw)
-            query = msg_original_stripped[idx:].strip()
-            if not query:
-                return "请告诉我你要搜索的关键词哦😊"
+    # ---- search: 搜索历史记录 ----
+    if intent == "search":
+        query = result.get("query", "").strip()
+        if not query:
+            return "请告诉我你要搜索的关键词哦😊"
 
-            logger.info(f"[yoyo] 搜索记录: query={query}")
-            records = inbox_ops.search_records(query=query, limit=10)
-            if not records:
-                return f"🔍 没有找到包含 '{query}' 的记录"
+        logger.info(f"[yoyo] 搜索记录: query={query}")
+        records = inbox_ops.search_records(query=query, limit=10)
+        if not records:
+            return f"🔍 没有找到包含 '{query}' 的记录"
 
-            response = f"🔍 找到 {len(records)} 条相关记录：\n\n"
-            for i, record in enumerate(records, 1):
-                frontmatter = record.get("frontmatter", {})
-                try:
-                    timestamp = datetime.fromisoformat(frontmatter.get("timestamp", "")).astimezone(TZ)
-                    time_str = timestamp.strftime("%Y-%m-%d %H:%M")
-                except:
-                    time_str = "未知时间"
+        response = f"🔍 找到 {len(records)} 条相关记录：\n\n"
+        for i, record in enumerate(records, 1):
+            frontmatter = record.get("frontmatter", {})
+            try:
+                timestamp = datetime.fromisoformat(frontmatter.get("timestamp", "")).astimezone(TZ)
+                time_str = timestamp.strftime("%Y-%m-%d %H:%M")
+            except:
+                time_str = "未知时间"
+            rec_content = record.get("content", "")
+            content_line = rec_content.split("\n")[0].strip()
+            content_line = (
+                content_line.lstrip("#").strip()[:30] + "..."
+                if len(content_line) > 30
+                else content_line
+            )
+            response += (
+                f"{i}. [{time_str}] [{frontmatter.get('content_type', 'note')}] {content_line}\n"
+            )
+        return response
 
-                rec_content = record.get("content", "")
-                content_line = rec_content.split("\n")[0].strip()
-                content_line = content_line.lstrip("#").strip()[:30] + "..." if len(content_line) > 30 else content_line
+    # ---- view_habits: 查看今日习惯完成状态 ----
+    if intent == "view_habits":
+        habits = todo_generator.get_habit_definitions()
+        if not habits:
+            return '📋 还没有记录任何习惯，告诉我"养成跑步的习惯"来添加吧！'
 
-                response += f"{i}. [{time_str}] [{frontmatter.get('content_type', 'note')}] {content_line}\n"
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        done_set = todo_generator.habit_tracker.get_done_today(today)
 
-            return response
-
-    # 4. 记录习惯
-    habit_keywords = ["习惯", "养成", "每天"]
-    for kw in habit_keywords:
-        if kw in msg_stripped and ("养成" in msg_stripped or "习惯" in msg_stripped):
-            logger.info(f"[yoyo] 匹配到习惯意图")
-
-            # 提取习惯描述 - 优先匹配"养成xxx的习惯"或"每天xxx"模式
-            habit_content = None
-
-            # 尝试匹配"养成xxx的习惯"
-            habit_match = re.search(r"养成\s*(.+?)\s*(的习惯|习惯[,，]|$)", msg_original_stripped)
-            if habit_match:
-                habit_content = habit_match.group(1).strip()
+        response = "📋 **今日习惯完成情况**\n\n"
+        done_count = 0
+        for h in habits:
+            if h in done_set:
+                response += f"- [x] {h} ✅\n"
+                done_count += 1
             else:
-                # 尝试匹配"每天xxx"
-                habit_match2 = re.search(r"每天\s*(.+?)\s*[,，]?(?!.*每天)", msg_original_stripped)
-                if habit_match2:
-                    habit_content = habit_match2.group(1).strip()
+                response += f"- [ ] {h}\n"
 
-            if habit_content:
-                logger.info(f"[yoyo] 提取到习惯内容: {habit_content}")
-                # 读取 habits.md 并追加
-                habits_file = Path(inbox_ops.data_dir) / "04-Events" / "habits.md"
-                if habits_file.exists():
-                    content = habits_file.read_text(encoding="utf-8")
-                    # 追加到每日习惯列表
-                    if "## 每日习惯" in content:
-                        # 检查是否已存在
-                        if habit_content not in content:
-                            content = content.replace(
-                                "## 每日习惯\n",
-                                f"## 每日习惯\n- [ ] {habit_content}\n"
-                            )
-                            habits_file.write_text(content, encoding="utf-8")
-                            logger.info(f"[yoyo] 习惯已写入 habits.md: {habit_content}")
-                            response = f"✅ 已帮你记录到习惯跟踪：\n📋 **{habit_content}**\n\n从明天开始执行，加油坚持！💪"
-                            logger.info(f"[yoyo] 回复: {response[:60]}...")
-                            return response
-                        else:
-                            logger.info(f"[yoyo] 习惯已存在: {habit_content}")
-                            return f"这个习惯已经记录过了哦：{habit_content}"
-                    else:
-                        logger.warning("[yoyo] habits.md 格式异常，缺少 ## 每日习惯")
-                        return "⚠️ 习惯文件格式不对，请检查 04-Events/habits.md"
+        if done_count > 0:
+            response += f"\n今日已完成 {done_count}/{len(habits)} 个习惯！"
+        else:
+            response += '\n今天还没打卡，加油！完成后告诉我（如"做了跑步"）'
+        return response
+
+    # ---- record_habit: 记录新习惯 ----
+    if intent == "record_habit":
+        habit_content = result.get("habit", "").strip()
+        if not habit_content:
+            return "请告诉我你想养成的习惯，例如「养成每天跑步的习惯」或「每天阅读30分钟」"
+
+        logger.info(f"[yoyo] 提取到习惯内容: {habit_content}")
+        habits_file = Path(inbox_ops.data_dir) / "04-Events" / "habits.md"
+        if habits_file.exists():
+            content = habits_file.read_text(encoding="utf-8")
+            if "## 每日习惯" in content:
+                if habit_content not in content:
+                    content = content.replace(
+                        "## 每日习惯\n", f"## 每日习惯\n- [ ] {habit_content}\n"
+                    )
+                    habits_file.write_text(content, encoding="utf-8")
+                    logger.info(f"[yoyo] 习惯已写入 habits.md: {habit_content}")
+                    return f"✅ 已帮你记录到习惯跟踪：\n📋 **{habit_content}**\n\n从明天开始执行，加油坚持！💪"
                 else:
-                    logger.warning(f"[yoyo] 习惯文件不存在: {habits_file}")
-                    return f"⚠️ 习惯文件不存在：{habits_file}"
-            break
+                    return f"这个习惯已经记录过了哦：{habit_content}"
+            else:
+                return "⚠️ 习惯文件格式不对，请检查 04-Events/habits.md"
+        else:
+            return f"⚠️ 习惯文件不存在：{habits_file}"
 
-    # 5. 标记任务完成
-    complete_keywords = ["完成", "搞定", "做完了"]
-    for kw in complete_keywords:
-        if kw in msg_stripped:
-            logger.info(f"[yoyo] 匹配到标记完成意图: keyword={kw}")
-            # 关键字之后、可能末尾的"任务/事情"之前的内容
-            idx = msg_stripped.find(kw) + len(kw)
-            task_keyword = msg_original_stripped[idx:].strip()
-            # 去掉末尾可能的"任务"或"事情"
-            task_keyword = re.sub(r"(任务|事情)$", "", task_keyword).strip()
-            if not task_keyword:
-                return "请告诉我你完成的任务关键词哦😊"
+    # ---- habit_checkin: 打卡完成习惯 ----
+    if intent == "habit_checkin":
+        all_habits = set(todo_generator.get_habit_definitions())
+        habit_names = result.get("habits", [])
 
-            # 搜索匹配的待办
-            pending_tasks = inbox_ops.search_records(query=task_keyword, content_type="todo", limit=5)
+        # 过滤：只保留存在于定义中的习惯名（LLM 可能返回缩写）
+        valid_names = [n for n in habit_names if n in all_habits]
+        if not valid_names:
+            all_list = "、".join(all_habits)
+            return f"没有识别出你要打卡哪个习惯。已定义的习惯：{all_list}"
 
-            pending_tasks = [
-                t for t in pending_tasks if t.get("frontmatter", {}).get("status") != "completed"
-            ]
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        now_iso = datetime.now(TZ).isoformat()
+        for name in valid_names:
+            todo_generator.habit_tracker.log_done(today, name, now_iso)
+            logger.info(f"[yoyo] 习惯打卡完成: {name}")
 
-            if not pending_tasks:
-                return f"没有找到包含 '{task_keyword}' 的待完成任务"
+        if len(valid_names) == 1:
+            return f"✅ 习惯打卡完成：**{valid_names[0]}**，继续保持！"
+        return f"✅ 已打卡 {len(valid_names)} 个习惯：**{'**、**'.join(valid_names)}**，继续保持！"
 
-            # 取第一个匹配的任务
-            task = pending_tasks[0]
-            task_path = task["path"]
-            logger.info(f"[yoyo] 标记任务完成: {task_keyword} -> {task_path}")
+    # ---- habit_stats: 习惯统计查询 ----
+    if intent == "habit_stats":
+        stats = todo_generator.habit_tracker.get_stats(days=30)
+        if not stats:
+            return "📊 还没有习惯执行记录，先记录一些习惯吧！"
 
-            # 移动到已完成目录
-            target_path = inbox_ops.move_record(task_path, "02-Tasks/Completed")
+        response = "📊 **习惯执行统计（近30天）**\n\n"
+        sorted_stats = sorted(stats.items(), key=lambda x: x[1]["rate"], reverse=True)
+        for name, data in sorted_stats:
+            bar_len = 10
+            filled = round(data["rate"] * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            emoji = "✅" if data["rate"] >= 0.8 else ("⚠️" if data["rate"] >= 0.5 else "❌")
+            response += (
+                f"{emoji} **{name}**\n"
+                f"  {bar} {data['done']}/{data['total']}天 ({data['rate']:.0%})\n"
+                f"  🔥 连续打卡 {data['streak']} 天\n\n"
+            )
+        return response
 
-            # 更新frontmatter
-            import yaml
+    # ---- mark_done: 标记任务完成 ----
+    if intent == "mark_done":
+        task_keywords = result.get("tasks", [])
+        if not task_keywords:
+            return "请告诉我你完成的任务关键词哦😊"
 
+        done_count = 0
+        for task_keyword in task_keywords:
+            logger.info(f"[yoyo] 标记任务完成: keyword={task_keyword}")
+            pending = inbox_ops.search_records(query=task_keyword, content_type="todo", limit=5)
+            pending = [t for t in pending if t.get("frontmatter", {}).get("status") != "completed"]
+
+            if not pending:
+                continue
+
+            task = pending[0]
+            target_path = inbox_ops.move_record(task["path"], "02-Tasks/Completed")
             content = target_path.read_text(encoding="utf-8")
-            if content.startswith("---"):
-                parts = content.split("---", 2)
-                if len(parts) >= 3:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    body = parts[2]
-                else:
-                    frontmatter = {}
-                    body = content
-            else:
-                frontmatter = {}
-                body = content
-
+            frontmatter, body = parse_frontmatter(content)
             frontmatter["status"] = "completed"
             frontmatter["completed_at"] = datetime.now(TZ).isoformat()
-
-            # 更新任务内容中的复选框
             body = body.replace("- [ ]", "- [x]", 1)
+            target_path.write_text(dump_frontmatter(frontmatter, body), encoding="utf-8")
+            done_count += 1
 
-            # 重新写入
-            yaml_content = yaml.dump(frontmatter, allow_unicode=True, sort_keys=False)
-            new_content = f"---\n{yaml_content}---\n{body}"
-            target_path.write_text(new_content, encoding="utf-8")
+        gtd_classifier.update_kanban()
 
-            # 更新Kanban
-            gtd_classifier.update_kanban()
+        if done_count == 0:
+            return f"没有找到包含这些关键词的待完成任务：{'、'.join(task_keywords)}"
+        return f"✅ 已完成 {done_count} 个任务！"
 
-            return f"✅ 已标记任务为完成！\n📝 任务内容：{task['content'][:50]}...\n📂 已归档到：{target_path}"
-
-    # 6. 生成日报
-    if re.match(r"^(今日|今天)(日报|回顾|总结)", msg_stripped):
+    # ---- generate_report: 生成日报 ----
+    if intent == "generate_report":
         logger.info("[yoyo] 生成日报")
         report_content, report_path = review_reminder.generate_daily_report()
         response = f"📰 今日日报已生成！\n📂 文件路径：{report_path}\n\n"
-        # 返回报告摘要
         lines = report_content.split("\n")[:30]
         response += "\n".join(lines)
         if len(report_content.split("\n")) > 30:
             response += "\n...（更多内容请查看完整报告）"
         return response
 
-    # 默认回复
-    logger.info(f"[yoyo] 未匹配任何意图，返回默认帮助信息")
-    return (
-        "🤖 我是你的私人秘书，我可以帮你：\n"
-        '1. 记录内容：对我说"记录 明天下午3点开评审会"\n'
-        '2. 查看今日待办：对我说"今日任务"\n'
-        '3. 搜索记录：对我说"搜索 项目需求"\n'
-        '4. 标记任务完成：对我说"完成 需求评审"\n'
-        '5. 记录习惯：对我说"养成每天走8000步的习惯"\n'
-        '6. 生成日报：对我说"今日日报"\n\n'
-        "有什么需要帮忙的吗？"
-    )
+    # LLM 区分不了意图 -> 反问用户
+    # if intent == "ask_user":
+    #     return "🤔 我没有完全理解你的意思。能说得更准确一些吗？"
+
+    # 默认回复 - 返回 None 让消息继续走到 LLM 处理
+    logger.info("[yoyo] 未匹配任何意图，返回 None 继续由 LLM 处理")
+    return None
 
 
 def get_scheduled_tasks():
@@ -389,13 +499,23 @@ def get_scheduled_tasks():
         }
     )
 
-    # 每分钟检查即将到期的任务
+    # 每300秒检查即将到期的任务
     tasks.append(
         {
-            "interval": 60,
+            "interval": 300,
             "name": "personal-secretary-check-upcoming",
             "description": "私人秘书检查即将到期的任务",
             "handler": lambda context: _check_upcoming_tasks(context),
+        }
+    )
+
+    # 每小时检查习惯完成情况
+    tasks.append(
+        {
+            "interval": 3600,
+            "name": "personal-secretary-habit-check",
+            "description": "私人秘书习惯执行检查",
+            "handler": lambda context: _check_habits(context),
         }
     )
 
@@ -404,51 +524,90 @@ def get_scheduled_tasks():
 
 async def _send_morning_brief(context):
     """发送早报"""
-    _init_instances(context.get("config", {}))
-    briefing = todo_generator.get_daily_morning_briefing()
-    await context["send_message"](briefing)
+    try:
+        _init_instances(context.get("config", {}))
+        briefing = todo_generator.get_daily_morning_briefing()
+        await context["send_message"](briefing)
+    except Exception as e:
+        logger.error(f"[yoyo] 发送早报失败: {e}")
 
 
 async def _send_evening_brief(context):
     """发送晚报"""
-    _init_instances(context.get("config", {}))
-    briefing = todo_generator.get_daily_evening_briefing()
-    await context["send_message"](briefing)
-    # 生成日报
-    review_reminder.generate_daily_report()
+    try:
+        _init_instances(context.get("config", {}))
+        briefing = todo_generator.get_daily_evening_briefing()
+        await context["send_message"](briefing)
+        # 生成日报
+        review_reminder.generate_daily_report()
+    except Exception as e:
+        logger.error(f"[yoyo] 发送晚报失败: {e}")
 
 
 async def _send_long_term_review(context):
     """发送长期事项回顾"""
-    _init_instances(context.get("config", {}))
-    msg, _ = review_reminder.get_long_term_review_reminder()
-    await context["send_message"](msg)
+    try:
+        _init_instances(context.get("config", {}))
+        msg, _ = review_reminder.get_long_term_review_reminder()
+        await context["send_message"](msg)
+    except Exception as e:
+        logger.error(f"[yoyo] 发送长期事项回顾失败: {e}")
 
 
 async def _send_weekly_review(context):
     """发送周度回顾提醒"""
-    _init_instances(context.get("config", {}))
-    msg = review_reminder.get_weekly_review_reminder()
-    await context["send_message"](msg)
-    # 生成周报
-    review_reminder.generate_weekly_report()
+    try:
+        _init_instances(context.get("config", {}))
+        msg = review_reminder.get_weekly_review_reminder()
+        await context["send_message"](msg)
+        # 生成周报
+        review_reminder.generate_weekly_report()
+    except Exception as e:
+        logger.error(f"[yoyo] 发送周度回顾失败: {e}")
 
 
 async def _do_monthly_backup(context):
     """月度备份和月报生成"""
-    _init_instances(context.get("config", {}))
-    # 生成月报
-    review_reminder.generate_monthly_report()
-    # 备份数据
-    backup_path = review_reminder.backup_data()
-    await context["send_message"](f"📦 月度数据备份已完成，备份文件：{backup_path}")
+    try:
+        _init_instances(context.get("config", {}))
+        # 生成月报
+        review_reminder.generate_monthly_report()
+        # 备份数据
+        backup_path = review_reminder.backup_data()
+        await context["send_message"](f"📦 月度数据备份已完成，备份文件：{backup_path}")
+    except Exception as e:
+        logger.error(f"[yoyo] 月度备份失败: {e}")
 
 
 async def _check_upcoming_tasks(context):
     """检查即将到期的任务"""
-    _init_instances(context.get("config", {}))
-    upcoming_tasks = todo_generator.get_upcoming_tasks()
-    for task in upcoming_tasks:
-        msg = todo_generator.generate_reminder_message(task)
-        await context["send_message"](msg)
-        todo_generator.mark_as_reminded(task["file_path"])
+    try:
+        _init_instances(context.get("config", {}))
+        upcoming_tasks = todo_generator.get_upcoming_tasks()
+        for task in upcoming_tasks:
+            msg = todo_generator.generate_reminder_message(task)
+            await context["send_message"](msg)
+            todo_generator.mark_as_reminded(task["file_path"])
+    except Exception as e:
+        logger.error(f"[yoyo] 检查到期任务失败: {e}")
+
+
+async def _check_habits(context):
+    """每小时检查习惯完成情况，未完成的习惯主动提醒"""
+    try:
+        _init_instances(context.get("config", {}))
+        now = datetime.now(TZ)
+        # 只在 8:00-22:00 之间提醒
+        if now.hour < 8 or now.hour >= 22:
+            return
+
+        unchecked = todo_generator.get_unchecked_habits()
+        if unchecked:
+            msg = "⏰ 习惯提醒时间！\n\n今天还有以下习惯未完成：\n"
+            for h in unchecked:
+                msg += f"- [ ] {h}\n"
+            msg += '\n完成后告诉我（如"做了跑步"），我来帮你打卡！'
+            await context["send_message"](msg)
+            logger.info(f"[yoyo] 推送习惯提醒: {unchecked}")
+    except Exception as e:
+        logger.error(f"[yoyo] 习惯检查失败: {e}")
