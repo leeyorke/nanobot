@@ -85,7 +85,7 @@ class SkillsLoader:
             ]
         return skills
 
-    def load_skill(self, name: str) -> Optional[str]:
+    def load_skill(self, name: str) -> str | None:
         """
         Load a skill by name.
 
@@ -247,7 +247,7 @@ class SkillsLoader:
             )
         ]
 
-    def get_skill_metadata(self, name: str) -> Optional[dict]:
+    def get_skill_metadata(self, name: str) -> dict | None:
         """
         Get metadata from a skill's frontmatter.
 
