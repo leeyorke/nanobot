@@ -26,16 +26,18 @@ from nanobot.security.network import validate_url_target
 # Transient connection errors that warrant a single retry.
 # These typically happen when an MCP server restarts or a network
 # connection is interrupted between calls.
-_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset((
-    "ClosedResourceError",
-    "BrokenResourceError",
-    "EndOfStream",
-    "BrokenPipeError",
-    "ConnectionResetError",
-    "ConnectionRefusedError",
-    "ConnectionAbortedError",
-    "ConnectionError",
-))
+_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset(
+    (
+        "ClosedResourceError",
+        "BrokenResourceError",
+        "EndOfStream",
+        "BrokenPipeError",
+        "ConnectionResetError",
+        "ConnectionRefusedError",
+        "ConnectionAbortedError",
+        "ConnectionError",
+    )
+)
 
 _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yarn", "bunx"))
 
@@ -162,6 +164,9 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
             await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
         return True
     except (OSError, asyncio.TimeoutError):
+        import traceback
+
+        traceback.print_exc()
         return False
 
 
@@ -351,9 +356,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                     timeout=self._tool_timeout,
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP tool '{}' timed out after {}s", self._name, self._tool_timeout
-                )
+                logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
                 return f"(MCP tool call timed out after {self._tool_timeout}s)"
             except asyncio.CancelledError:
                 # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
@@ -761,7 +764,9 @@ async def connect_mcp_servers(
             registered_count = 0
             matched_enabled_tools: set[str] = set()
             available_raw_names = [tool_def.name for tool_def in tools.tools]
-            available_wrapped_names = [_sanitize_name(f"mcp_{name}_{tool_def.name}") for tool_def in tools.tools]
+            available_wrapped_names = [
+                _sanitize_name(f"mcp_{name}_{tool_def.name}") for tool_def in tools.tools
+            ]
             for tool_def in tools.tools:
                 wrapped_name = _sanitize_name(f"mcp_{name}_{tool_def.name}")
                 if (
@@ -1063,11 +1068,15 @@ async def request_mcp_reload(bus: Any, *, timeout: float = 15.0) -> dict[str, An
             "message": "MCP hot reload timed out. Restart nanobot to pick up changes.",
             "requires_restart": True,
         }
-    return result if isinstance(result, dict) else {
-        "ok": False,
-        "message": "MCP hot reload returned an unexpected response.",
-        "requires_restart": True,
-    }
+    return (
+        result
+        if isinstance(result, dict)
+        else {
+            "ok": False,
+            "message": "MCP hot reload returned an unexpected response.",
+            "requires_restart": True,
+        }
+    )
 
 
 async def handle_runtime_control(state: Any, msg: InboundMessage, registry: ToolRegistry) -> bool:
@@ -1158,7 +1167,9 @@ async def _refresh_terminated_server(
         _attach_reconnect_handlers(state, registry, connected)
         state._mcp_connected = bool(state._mcp_stacks)
         if server_name not in connected:
-            logger.warning("MCP server '{}' reconnect failed after session termination", server_name)
+            logger.warning(
+                "MCP server '{}' reconnect failed after session termination", server_name
+            )
             return None
         return registry.get(tool_name)
 
