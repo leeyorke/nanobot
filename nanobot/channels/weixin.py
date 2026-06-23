@@ -500,7 +500,13 @@ class WeixinChannel(BaseChannel):
             except httpx.TimeoutException:
                 # Normal for long-poll, just retry
                 continue
-            except (httpx.ReadError, httpx.RemoteProtocolError, httpcore.ReadError):
+            except (
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpcore.ReadError,
+                httpx.ConnectError,
+                httpcore.ConnectError,
+            ):
                 self.logger.warning("WeChat connection broken, recreating client...")
                 self._client = httpx.AsyncClient()
                 continue
