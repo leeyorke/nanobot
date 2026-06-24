@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -342,6 +343,9 @@ class MCPServerConfig(Base):
     enabled_tools: list[str] = Field(
         default_factory=lambda: ["*"]
     )  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
+    allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = Field(
+        default_factory=list
+    )
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:

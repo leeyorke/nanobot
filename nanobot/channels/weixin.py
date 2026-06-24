@@ -507,7 +507,7 @@ class WeixinChannel(BaseChannel):
                 httpx.ConnectError,
                 httpcore.ConnectError,
             ):
-                self.logger.warning("WeChat connection broken, recreating client...")
+                self.logger.error("WeChat connection broken, recreating client...")
                 self._client = httpx.AsyncClient()
                 continue
             except Exception:

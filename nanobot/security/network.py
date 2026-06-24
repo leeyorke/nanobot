@@ -98,8 +98,6 @@ def validate_url_target(url: str, *, allow_loopback: bool = False) -> tuple[bool
         return True, ""
     for addr in addrs:
         if _is_private(addr):
-            if str(addr) in ("172.17.224.1",):
-                continue
             return False, f"Blocked: {hostname} resolves to private/internal address {addr}"
 
     return True, ""

@@ -64,7 +64,12 @@ def _apply_ssrf_whitelist(config: Config) -> None:
     """Apply SSRF whitelist from config to the network security module."""
     from nanobot.security.network import configure_ssrf_whitelist
 
+    # 原有的全局 SSRF 白名单
     configure_ssrf_whitelist(config.tools.ssrf_whitelist)
+    # 加上每个 MCP 服务器的 allowed_networks
+    for name, mcp_cfg in config.tools.mcp_servers.items():
+        if mcp_cfg.allowed_networks:
+            configure_ssrf_whitelist([str(n) for n in mcp_cfg.allowed_networks])
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -144,9 +149,7 @@ def _env_replace(match: re.Match[str]) -> str:
     name = match.group(1)
     value = os.environ.get(name)
     if value is None:
-        raise ValueError(
-            f"Environment variable '{name}' referenced in config is not set"
-        )
+        raise ValueError(f"Environment variable '{name}' referenced in config is not set")
     return value
 
 

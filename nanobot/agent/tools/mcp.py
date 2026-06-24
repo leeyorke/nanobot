@@ -163,10 +163,11 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
         with suppress(OSError, asyncio.TimeoutError):
             await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
         return True
-    except (OSError, asyncio.TimeoutError):
-        import traceback
-
-        traceback.print_exc()
+    except ConnectionRefusedError:
+        logger.warning(f"MCP {host}:{port} connect refused.")
+        return False
+    except (OSError, asyncio.TimeoutError) as e:
+        logger.warning("MCP:{}:{} unreachable: {}", host, port, e)
         return False
 
 
@@ -746,6 +747,25 @@ async def connect_mcp_servers(
                         timeout=httpx.Timeout(30.0, connect=10.0),
                     )
                 )
+                # 在关闭obsidian后, mcp server也会随之关闭, 但是我暴露的172.*.*.1的地址（wsl映射的宿主机的localhost）
+                # 还在监听, nanobot这时去连接时会出问题, 所以需要在抛出异常的时候完全阻断异常传播保证 server_stack 正确关闭
+                # 保证 gateway 不会因为 MCP 崩溃, 保证 client 不会进入未定义状态
+                # 小丑了, 在 WSL2 中是可以通过 localhost 直接访问 Windows 的 localhost 的！
+                try:
+                    client = streamable_http_client(cfg.url, http_client=http_client)
+                except Exception:
+                    logger.error("MCP crashed, disabling MCP for this session")
+                    await server_stack.aclose()
+                    return name, None
+                else:
+                    try:
+                        read, write, _ = await server_stack.enter_async_context(client)
+                    except Exception as e:
+                        logger.error(
+                            "MCP server '{}': failed to enter MCP client context: {}", name, e
+                        )
+                        await server_stack.aclose()
+                        return name, None
                 read, write, _ = await server_stack.enter_async_context(
                     streamable_http_client(cfg.url, http_client=http_client)
                 )
@@ -850,7 +870,7 @@ async def connect_mcp_servers(
                     " Hint: this looks like stdio protocol pollution. Make sure the MCP server writes "
                     "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
                 )
-            logger.exception("MCP server '{}': failed to connect: {}", name, hint)
+            logger.error("MCP server '{}': failed to connect: {}", name, hint)
             with suppress(Exception):
                 await server_stack.aclose()
             return name, None
@@ -861,7 +881,7 @@ async def connect_mcp_servers(
         try:
             result = await connect_single_server(name, cfg)
         except Exception as e:
-            logger.exception("MCP server '{}' connection failed: {}", name, e)
+            logger.error("MCP server '{}' connection failed: {}", name, e)
             continue
         if result is not None and result[1] is not None:
             server_stacks[result[0]] = result[1]
