@@ -2,7 +2,7 @@ This file provides guidance to AI coding agents working with this repository.
 
 ## Project Overview
 
-nanobot is a lightweight, open-source AI agent framework written in Python with a React/TypeScript WebUI. It centers around a small agent loop that receives messages from chat channels, invokes an LLM provider, executes tools, and manages session memory.
+nanobot is a lightweight, open-source AI agent framework written in Python with a React/TypeScript WebUI. It centers around a small agent loop that receives messages from chat channels, invokes an LLM provider, executes tools, and manages session memory. Package name: `nanobot-ai`.
 
 ## Development Commands
 
@@ -41,25 +41,31 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 - **Memory** (`nanobot/agent/memory.py`): Session history persistence with Dream two-phase memory consolidation. Uses atomic writes with fsync for durability.
 - **Session Management** (`nanobot/session/`): Per-session history, context compaction, TTL-based auto-compaction (`manager.py`), and sustained goal state tracking (`goal_state.py`).
 - **Config** (`nanobot/config/schema.py`, `loader.py`): Pydantic-based configuration loaded from `~/.nanobot/config.json`. Supports camelCase aliases for JSON compatibility.
-- **Bridge** (`bridge/`): TypeScript services (e.g. WhatsApp bridge) bundled into the wheel via `pyproject.toml` `force-include`.
-- **WebUI** (`webui/`): Vite-based React SPA that talks to the gateway over a WebSocket multiplex protocol. The dev server proxies `/api`, `/webui`, `/auth`, and WebSocket traffic to the gateway.
+- **Gateway** (`nanobot/gateway/`): Background process control for `nanobot gateway` — process state, log files, platform-specific detach/stop.
+- **SDK** (`nanobot/sdk/`): Python SDK for programmatic agent access — client helpers, streaming, runtime wrappers for calling the agent loop from code.
+- **WebUI Backend** (`nanobot/webui/`): Gateway-side server services for the React SPA — settings, MCP presets, session management, media, workspace management, forking, token usage, WebSocket logging.
+- **WebUI Frontend** (`webui/`): Vite-based React SPA that talks to the gateway over a WebSocket multiplex protocol. The dev server proxies `/api`, `/webui`, `/auth`, and WebSocket traffic to the gateway.
 - **API Server** (`nanobot/api/server.py`): OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`) for programmatic access.
+- **Audio** (`nanobot/audio/`): Application-level audio transcription service — config resolution, upload validation, dispatch to provider adapters.
+- **Apps** (`nanobot/apps/`): Agent app manifest protocol (`protocol.py`) and CLI app service (`cli/service.py`) for settings-managed agent capabilities.
 - **Command Router** (`nanobot/command/`): Slash command routing and built-in command handlers.
 - **Heartbeat** (`nanobot/templates/HEARTBEAT.md`): Periodic task list checked via `cron` jobs (legacy dedicated service removed).
 - **Pairing** (`nanobot/pairing/`): DM sender approval store with persistent pairing codes per channel.
 - **Skills** (`nanobot/skills/`): Built-in skill definitions (long-goal, cron, github, image-generation, etc.) loaded into agent context.
-- **Security** (`nanobot/security/`): PTH file guard and other security measures activated at CLI entry.
+- **Security** (`nanobot/security/`): PTH file guard, SSRF protection (`security/network.py`), and other security measures activated at CLI entry.
+- **Utils** (`nanobot/utils/`): Shared utilities — document parsing, gitstore, LLM runtime helpers, prompt templates, path resolution, media decoding, progress events, artifact handling, etc.
 
 ### Entry Points
 
-- **CLI**: `nanobot/cli/commands.py`
+- **CLI**: `nanobot.cli.commands:app` (registered as `nanobot` console script)
 - **Python SDK**: `nanobot/nanobot.py`
+- **`__main__`**: `nanobot/__main__.py` (supports `python -m nanobot`)
 
 ## Project-Specific Notes
 
 - Architecture constraints: [`.agent/design.md`](.agent/design.md)
 - Security boundaries: [`.agent/security.md`](.agent/security.md)
-- Common gotchas: [`.agent/gotchas.md`](.agent/gotchas.md)
+- Common gotchas: [`.agent/gotchas.md`](.agent/gotchas.md) — notably **do not run `ruff format`** (destroys git blame), use only `ruff check`.
 
 ## Contribution Flow
 
@@ -80,3 +86,4 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for contribution flow and PR guidelin
 - Tool registry: `nanobot/agent/tools/registry.py`
 - WebUI dev proxy config: `webui/vite.config.ts`
 - Tests mirror the `nanobot/` package structure.
+- Prompt templates (Jinja2): `nanobot/templates/`

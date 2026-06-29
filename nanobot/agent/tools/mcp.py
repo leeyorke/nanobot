@@ -766,9 +766,7 @@ async def connect_mcp_servers(
                         )
                         await server_stack.aclose()
                         return name, None
-                read, write, _ = await server_stack.enter_async_context(
-                    streamable_http_client(cfg.url, http_client=http_client)
-                )
+
             else:
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
                 await server_stack.aclose()
