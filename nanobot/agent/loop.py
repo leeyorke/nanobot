@@ -66,6 +66,7 @@ from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
+from nanobot.utils.skill_command import skill_command_prompt
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -631,7 +632,10 @@ class AgentLoop:
         scope = self.workspace_scopes.for_message(msg, session.metadata)
         return self.context.build_messages(
             history=history,
-            current_message=image_generation_prompt(msg.content, msg.metadata),
+            current_message=skill_command_prompt(
+                image_generation_prompt(msg.content, msg.metadata),
+                self.context.skills,
+            ),
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=self._runtime_chat_id(msg),
