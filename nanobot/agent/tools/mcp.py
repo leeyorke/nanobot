@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shutil
+import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
@@ -46,6 +47,61 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 _SANITIZE_RE = re.compile(r"_+")
 _RELOAD_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
+
+
+# ── MCP connection health tracker ────────────────────────────────────────────
+# Tracks per-server disconnect state so that wrapper ``execute()`` can
+# short-circuit with a friendly message instead of crashing the agent loop.
+class _MCPHealthTracker:
+    """Thread-safe (async-safe) health-state store for connected MCP servers."""
+
+    __slots__ = ("_data", "_lock")
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def mark_connected(self, server_name: str) -> None:
+        async with self._lock:
+            self._data[server_name] = {
+                "connected": True,
+                "disconnected_at": None,
+                "status": "connected",
+            }
+
+    async def mark_disconnected(self, server_name: str, reason: str = "") -> None:
+        async with self._lock:
+            data = self._data.get(server_name)
+            if data is None:
+                self._data[server_name] = {
+                    "connected": False,
+                    "disconnected_at": time.monotonic(),
+                    "status": f"disconnected ({reason})",
+                }
+            else:
+                data["connected"] = False
+                data["disconnected_at"] = time.monotonic()
+                data["status"] = f"disconnected ({reason})"
+
+    async def get_status(self, server_name: str) -> dict[str, Any]:
+        async with self._lock:
+            return dict(self._data.get(server_name, {"connected": True}))
+
+    def get_status_sync(self, server_name: str) -> dict[str, Any]:
+        """Synchronous read for use in sync contexts (e.g. ``runtime_lines``)."""
+        return dict(self._data.get(server_name, {"connected": True}))
+
+
+# Global health tracker shared across all agent loop instances via ``state``.
+_mcp_health = _MCPHealthTracker()
+_global_server_reconnect_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_server_reconnect_lock(server_name: str) -> asyncio.Lock:
+    """Return (creating lazily) a per-server lock to serialize reconnection."""
+    if server_name not in _global_server_reconnect_locks:
+        _global_server_reconnect_locks[server_name] = asyncio.Lock()
+    return _global_server_reconnect_locks[server_name]
 
 
 def _is_malformed_mcp_progress_notification(message: Any) -> bool:
@@ -128,17 +184,42 @@ def _is_transient(exc: BaseException) -> bool:
     return type(exc).__name__ in _TRANSIENT_EXC_NAMES
 
 
+# All known indicators of a dead/terminated MCP server session, grouped by
+# transport type so the markers are easy to audit.
+_SESSION_TERMINATED_MARKERS: frozenset[str] = frozenset(
+    (
+        # Generic / protocol-level
+        "session terminated",
+        "connection closed",
+        "session closed",
+        "session ended",
+        "server disconnected",
+        "no more messages",
+        # Stdio transport
+        "stdin closed",
+        "stdin eof",
+        "process exited",
+        "process terminated",
+        "process died",
+        "broken pipe",
+        # SSE / HTTP transport
+        "connection reset",
+        "eof received",
+        "transport closed",
+        "closed by remote peer",
+        "stream closed",
+    )
+)
+
+
 def _is_session_terminated(exc: BaseException) -> bool:
     """Return True when the MCP SDK reports a dead client session."""
-    messages = [str(exc)]
+    messages: list[str] = [str(exc)]
     error = getattr(exc, "error", None)
     if error is not None:
         messages.append(str(getattr(error, "message", "")))
-    return any(
-        marker in message.lower()
-        for marker in ("session terminated", "connection closed")
-        for message in messages
-    )
+    text = " ".join(messages).lower()
+    return any(marker in text for marker in _SESSION_TERMINATED_MARKERS)
 
 
 async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
@@ -348,6 +429,22 @@ class MCPToolWrapper(_MCPWrapperBase):
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
 
+        # Pre-check: if server is already marked disconnected, short-circuit
+        # with a friendly message instead of crashing the agent loop.
+        status = await _mcp_health.get_status(self._server_name)
+        if not status.get("connected", True):
+            logger.warning(
+                "MCP tool '{}' called while server '{}' is disconnected: {}",
+                self._name,
+                self._server_name,
+                status.get("status", "unknown"),
+            )
+            return (
+                f"(MCP tool execution failed: MCP server '{self._server_name}' is currently "
+                "disconnected. Please check that the server is running — nanobot will "
+                "automatically attempt to reconnect when the server becomes available.)"
+            )
+
         retried_transient = False
         refreshed_session = False
         while True:
@@ -448,6 +545,22 @@ class MCPResourceWrapper(_MCPWrapperBase):
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
+
+        # Pre-check: if server is already marked disconnected, short-circuit
+        # with a friendly message instead of crashing the agent loop.
+        status = await _mcp_health.get_status(self._server_name)
+        if not status.get("connected", True):
+            logger.warning(
+                "MCP resource '{}' called while server '{}' is disconnected: {}",
+                self._name,
+                self._server_name,
+                status.get("status", "unknown"),
+            )
+            return (
+                f"(MCP resource read failed: MCP server '{self._server_name}' is currently "
+                "disconnected. Please check that the server is running — nanobot will "
+                "automatically attempt to reconnect when the server becomes available.)"
+            )
 
         retried_transient = False
         refreshed_session = False
@@ -564,6 +677,22 @@ class MCPPromptWrapper(_MCPWrapperBase):
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
         from mcp.shared.exceptions import McpError
+
+        # Pre-check: if server is already marked disconnected, short-circuit
+        # with a friendly message instead of crashing the agent loop.
+        status = await _mcp_health.get_status(self._server_name)
+        if not status.get("connected", True):
+            logger.warning(
+                "MCP prompt '{}' called while server '{}' is disconnected: {}",
+                self._name,
+                self._server_name,
+                status.get("status", "unknown"),
+            )
+            return (
+                f"(MCP prompt call failed: MCP server '{self._server_name}' is currently "
+                "disconnected. Please check that the server is running — nanobot will "
+                "automatically attempt to reconnect when the server becomes available.)"
+            )
 
         retried_transient = False
         refreshed_session = False
@@ -923,6 +1052,19 @@ def runtime_lines(
         display = str(item.get("display_name") or raw_name).strip() or raw_name
         transport = str(item.get("transport") or "mcp").strip() or "mcp"
         prefix = f"mcp_{raw_name}_"
+        # Check health tracker for real-time disconnect status. The tracker keys
+        # use the original configured casing; look up with the original name.
+        tracker_name = str(item.get("name") or "").strip() or raw_name
+        health_status = _mcp_health.get_status_sync(tracker_name)
+        if not health_status.get("connected", True):
+            reason = health_status.get("status", "unknown")
+            lines.append(
+                "⚠️ MCP Preset Attachment (DISCONNECTED): "
+                f"@{raw_name} ({display}; transport={transport}) is currently disconnected. "
+                f"Reason: {reason}. nanobot will automatically attempt to reconnect. "
+                f"Tools with prefix `{prefix}` may be unavailable."
+            )
+            continue
         if configured_server_names is not None and raw_name not in configured_server_names:
             lines.append(
                 "MCP Preset Attachment: "
@@ -957,24 +1099,28 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
     }
     if state._mcp_connecting or not missing_servers:
         return
-    state._mcp_connecting = True
-    try:
-        connected = await connect_mcp_servers(missing_servers, registry)
-        state._mcp_stacks.update(connected)
-        _attach_reconnect_handlers(state, registry, connected)
-        state._mcp_connected = bool(state._mcp_stacks)
-        if connected:
-            logger.info("MCP connected servers: {}", sorted(connected))
-        else:
-            logger.warning("No MCP servers connected successfully (will retry next message)")
-    except asyncio.CancelledError:
-        logger.warning("MCP connection cancelled (will retry next message)")
-        state._mcp_connected = bool(state._mcp_stacks)
-    except BaseException as e:
-        logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
-        state._mcp_connected = bool(state._mcp_stacks)
-    finally:
-        state._mcp_connecting = False
+    # Hold the reload lock so a concurrent hot-reload cannot race this connect.
+    async with _reload_lock(state):
+        state._mcp_connecting = True
+        try:
+            connected = await connect_mcp_servers(missing_servers, registry)
+            state._mcp_stacks.update(connected)
+            _attach_reconnect_handlers(state, registry, connected)
+            state._mcp_connected = bool(state._mcp_stacks)
+            if connected:
+                for name in connected:
+                    await _mcp_health.mark_connected(name)
+                logger.info("MCP connected servers: {}", sorted(connected))
+            else:
+                logger.warning("No MCP servers connected successfully (will retry next message)")
+        except asyncio.CancelledError:
+            logger.warning("MCP connection cancelled (will retry next message)")
+            state._mcp_connected = bool(state._mcp_stacks)
+        except BaseException as e:
+            logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
+            state._mcp_connected = bool(state._mcp_stacks)
+        finally:
+            state._mcp_connecting = False
 
 
 async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
@@ -1023,6 +1169,8 @@ async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
             connected = await connect_mcp_servers(to_connect, registry)
             state._mcp_stacks.update(connected)
             _attach_reconnect_handlers(state, registry, connected)
+            for name in connected:
+                await _mcp_health.mark_connected(name)
 
         state._mcp_connected = bool(state._mcp_stacks)
         failed = sorted(set(to_connect) - set(connected))
@@ -1159,13 +1307,16 @@ async def _refresh_terminated_server(
     tool_name: str,
     stale_tool: Tool,
 ) -> Tool | None:
-    async with _reload_lock(state):
+    # Hold the reload lock so a concurrent hot-reload does not race this
+    # reconnect, then the per-server lock to serialize duplicate reconnects.
+    async with _reload_lock(state), _get_server_reconnect_lock(server_name):
         cfg = state._mcp_servers.get(server_name)
         if cfg is None:
             logger.warning(
                 "MCP server '{}' session terminated but is no longer configured",
                 server_name,
             )
+            await _mcp_health.mark_disconnected(server_name, "no config")
             return None
 
         current_tool = registry.get(tool_name)
@@ -1174,9 +1325,14 @@ async def _refresh_terminated_server(
             and current_tool is not stale_tool
             and server_name in state._mcp_stacks
         ):
+            # Another thread already reconnected — mark healthy
+            await _mcp_health.mark_connected(server_name)
             return current_tool
 
         logger.warning("MCP server '{}' session terminated; refreshing connection", server_name)
+        # Mark disconnected immediately so wrapper execute() can short-circuit
+        await _mcp_health.mark_disconnected(server_name, "session terminated")
+
         _unregister_server_tools(state, registry, server_name)
         await _close_server(state, server_name)
 
@@ -1189,6 +1345,8 @@ async def _refresh_terminated_server(
                 "MCP server '{}' reconnect failed after session termination", server_name
             )
             return None
+        # Reconnection succeeded — mark connected and clear disconnect timestamp
+        await _mcp_health.mark_connected(server_name)
         return registry.get(tool_name)
 
 

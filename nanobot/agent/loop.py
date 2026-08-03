@@ -27,6 +27,13 @@ from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRun
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.mcp import (
+    _close_server,
+    _mcp_health,
+    _probe_http_url,
+    _unregister_server_tools,
+    connect_missing_servers,
+)
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
@@ -75,6 +82,7 @@ if TYPE_CHECKING:
         ToolsConfig,
     )
     from nanobot.cron.service import CronService
+
 
 class TurnState(Enum):
     RESTORE = auto()
@@ -300,6 +308,7 @@ class AgentLoop:
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._last_mcp_health_check: float = 0.0
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -521,6 +530,79 @@ class AgentLoop:
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
         await agent_context.connect_mcp(self, self.tools)
+
+    async def _mcp_health_check(self) -> None:
+        """Periodically probe and reconnect MCP servers, in the main loop.
+
+        Runs at most every 30s. Probes HTTP/SSE servers' ports, drops stale
+        connections, and attempts to reconnect missing servers.
+
+        NOTE: this runs in the main loop's context (like ``auto_compact``)
+        instead of a background task. A background task inherits the main
+        loop's anyio cancel-scope context; when MCP SDK cleanup fires a cancel
+        scope (e.g. after a port drop), the cancellation propagates back into
+        the main loop and crashes the gateway. Running inline avoids that.
+        """
+        now = time.monotonic()
+        if now - self._last_mcp_health_check < 30:
+            return
+        self._last_mcp_health_check = now
+        try:
+            # 1) For already-connected HTTP/SSE MCP servers, probe the port.
+            #    If the port is gone, drop the connection immediately so
+            #    wrapper pre-checks and runtime_lines see the disconnected state.
+            dead_servers: list[str] = []
+            for name, cfg in list(self._mcp_servers.items()):
+                if name not in self._mcp_stacks:
+                    continue
+                url = getattr(cfg, "url", None)
+                if not url:
+                    continue
+                transport = getattr(cfg, "type", None) or (
+                    "sse" if url.rstrip("/").endswith("/sse") else "streamableHttp"
+                )
+                if transport not in {"sse", "streamableHttp"}:
+                    continue
+                if not await _probe_http_url(url, timeout=1.5):
+                    logger.warning(
+                        "MCP server '{}' port probe failed ({} unreachable); "
+                        "dropping stale connection",
+                        name,
+                        url,
+                    )
+                    _unregister_server_tools(self, self.tools, name)
+                    await _close_server(self, name)
+                    await _mcp_health.mark_disconnected(name, "port probe failed")
+                    dead_servers.append(name)
+
+            # 2) Find all configured servers that are not connected
+            missing = {
+                name: cfg
+                for name, cfg in self._mcp_servers.items()
+                if name not in self._mcp_stacks
+            }
+            if not missing and not dead_servers:
+                return
+
+            if dead_servers:
+                logger.warning(
+                    "MCP health check: {} server(s) dropped due to port failure: {}",
+                    len(dead_servers),
+                    sorted(dead_servers),
+                )
+
+            if missing:
+                logger.info(
+                    "MCP health check: attempting to reconnect servers: {}",
+                    sorted(missing.keys()),
+                )
+                await connect_missing_servers(self, self.tools)
+
+        except asyncio.CancelledError:
+            # Shutdown in progress; propagate.
+            raise
+        except Exception as exc:
+            logger.warning("MCP health check error: {}", exc)
 
     def _set_tool_context(
         self,
@@ -819,9 +901,12 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+
         # Compute lazily because long_task may create goal metadata during this run.
         def _goal_continue() -> str | None:
-            _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
+            _goal_lines = goal_state_runtime_lines(
+                session.metadata if session is not None else None
+            )
             if not _goal_lines:
                 return None
             return (
@@ -861,9 +946,9 @@ class AgentLoop:
                         metadata=session_metadata,
                         message_metadata=metadata,
                     ),
-                    goal_active_predicate=lambda: sustained_goal_active(session.metadata)
-                    if session is not None
-                    else False,
+                    goal_active_predicate=lambda: (
+                        sustained_goal_active(session.metadata) if session is not None else False
+                    ),
                     goal_continue_message=_goal_continue,
                     finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
                         pending_queue_available=pending_queue is not None and session is not None,
@@ -915,6 +1000,7 @@ class AgentLoop:
                         self._schedule_background,
                         active_session_keys=self._pending_queues.keys(),
                     )
+                    await self._mcp_health_check()
                     continue
                 except asyncio.CancelledError:
                     # Preserve real task cancellation so shutdown can complete cleanly.
@@ -932,7 +1018,9 @@ class AgentLoop:
                     continue
                 if self.commands.is_priority(raw):
                     await self._dispatch_command_inline(
-                        msg, effective_key, raw,
+                        msg,
+                        effective_key,
+                        raw,
                         self.commands.dispatch_priority,
                     )
                     continue
@@ -954,7 +1042,9 @@ class AgentLoop:
                     # dispatch them directly (same pattern as priority commands).
                     if self.commands.is_dispatchable_command(raw):
                         await self._dispatch_command_inline(
-                            msg, effective_key, raw,
+                            msg,
+                            effective_key,
+                            raw,
                             self.commands.dispatch,
                         )
                         continue
@@ -982,10 +1072,11 @@ class AgentLoop:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(effective_key, []).append(task)
                 task.add_done_callback(
-                    lambda t, k=effective_key: self._active_tasks.get(k, [])
-                    and self._active_tasks[k].remove(t)
-                    if t in self._active_tasks.get(k, [])
-                    else None
+                    lambda t, k=effective_key: (
+                        self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
+                        if t in self._active_tasks.get(k, [])
+                        else None
+                    )
                 )
         finally:
             # MCP stdio transports use AnyIO cancel scopes; close them from the task that opened them.
@@ -1159,10 +1250,14 @@ class AgentLoop:
                 await self._cron_turns.publish_next_deferred(session_key)
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
+        """Cancel pending background tasks, then close MCP connections."""
+        # Cancel any tracked background tasks (e.g. auto-compaction). We do NOT
+        # await them here and we do NOT clear the list: a cancelled task can
+        # leak CancelledError through anyio cancel scopes and crash shutdown,
+        # and each task's done callback removes itself from the list.
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
         for name, stack in self._mcp_stacks.items():
             try:
                 await stack.aclose()
@@ -1879,8 +1974,12 @@ class AgentLoop:
         if not persist_user_message:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(
-            channel=channel, sender_id=sender_id, chat_id=chat_id,
-            content=content, media=media or [], metadata=metadata,
+            channel=channel,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
+            metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
