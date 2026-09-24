@@ -38,3 +38,11 @@ Built-in skills live in `nanobot/skills/` (markdown + YAML frontmatter format). 
 ## Atomic Session Writes
 
 `agent/memory.py` writes `history.jsonl` atomically (temp file + fsync + rename + directory fsync). This guarantees durability across crashes. Do not replace this with a plain `open(..., "w")` write.
+
+## MCP Handshake Failures Are `BaseException`s
+
+When an MCP server rejects the handshake (401/403 from a wrong token, closed socket, ...), the MCP SDK's `anyio` task group tears down its cancel scope from the *wrong task*. What our coroutine receives is a `CancelledError` named after that scope or a `BaseExceptionGroup` wrapping one — both inherit from `BaseException`, so a plain `except Exception` does not catch them and they escape into the agent loop, crashing the gateway.
+
+Guard the handshake in `agent/tools/mcp.py` with `_is_mcp_sdk_cancellation()` and only swallow that specific leak: an externally requested cancellation (`task.cancel()`) yields a `CancelledError` with an empty message and must be re-raised so `/stop` and shutdown still work.
+
+Do not add a pre-flight HTTP auth probe to detect a bad token early. It duplicates the `initialize` request the server receives and changes the observable request sequence covered by the SSRF/redirect tests in `tests/tools/test_mcp_tool.py`. Detect it once, at the handshake.

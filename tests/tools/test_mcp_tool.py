@@ -13,6 +13,7 @@ from nanobot.agent.tools.mcp import (
     MCPPromptWrapper,
     MCPResourceWrapper,
     MCPToolWrapper,
+    _is_mcp_sdk_cancellation,
     _normalize_windows_stdio_command,
     _sanitize_name,
     connect_mcp_servers,
@@ -1104,3 +1105,210 @@ async def test_connect_mcp_servers_enabled_tools_matches_sanitized_name(
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_My_Tool"]
+
+
+# ---------------------------------------------------------------------------
+# connect_mcp_servers: handshake failures must disable one server, not the loop
+# ---------------------------------------------------------------------------
+
+
+class _FailingInitializeSession:
+    """A ClientSession whose ``initialize()`` raises a BaseException the way the
+    MCP SDK really does when the server rejects the request (e.g. 401 with a
+    wrong token): the anyio task group cancels its scope and the caller sees a
+    ``CancelledError`` (or a ``BaseExceptionGroup`` wrapping one)."""
+
+    def __init__(self, exc: BaseException | None) -> None:
+        self._exc = exc
+
+    async def initialize(self) -> None:
+        if self._exc is not None:
+            raise self._exc
+
+    async def list_tools(self) -> SimpleNamespace:
+        return SimpleNamespace(tools=[_make_tool_def("demo")])
+
+
+def _sdk_cancellation() -> asyncio.CancelledError:
+    return asyncio.CancelledError("Cancelled via cancel scope 1234abcd")
+
+
+def _external_cancellation() -> asyncio.CancelledError:
+    return asyncio.CancelledError()
+
+
+async def _reachable(_url: str) -> bool:
+    return True
+
+
+def _patch_failing_session(
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+    *,
+    read: str = "any",
+    good_session: object = None,
+) -> None:
+    """Make the ``ClientSession`` used by ``connect_mcp_servers`` raise from
+    ``initialize()`` the way the broken SDK path does.
+
+    ``read`` selects which transport stream fails, so a sibling server can
+    still receive ``good_session`` and connect normally.
+    """
+
+    class _FailingSession(_FailingInitializeSession):
+        def __init__(self, read_stream: object, _write: object) -> None:
+            fails = read == "any" or read_stream == read
+            super().__init__(exc if fails else None)
+
+        async def __aenter__(self) -> object:
+            # The session object enters cleanly, just like the real SDK: it is
+            # the handshake inside initialize() that blows up.
+            return self._good() if self._exc is None else self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def _good(self) -> object:
+            assert good_session is not None
+            return good_session
+
+    monkeypatch.setattr(sys.modules["mcp"], "ClientSession", _FailingSession)
+    monkeypatch.setattr(mcp_mod, "_probe_http_url", _reachable)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _sdk_cancellation(),
+        BaseExceptionGroup(
+            "unhandled errors in a TaskGroup (1 sub-exception)",
+            [_sdk_cancellation()],
+        ),
+    ],
+    ids=["sdk-cancelled", "task-group"],
+)
+async def test_connect_mcp_servers_survives_non_exception_handshake_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+) -> None:
+    """A wrong token makes the SDK raise CancelledError/BaseExceptionGroup from
+    ``initialize()``; those are BaseExceptions, so a plain ``except Exception``
+    never caught them and they crashed the gateway.  The bad server must be
+    dropped without the caller seeing anything but an empty result."""
+    monkeypatch.setattr(mcp_mod, "validate_url_target", lambda _u: (True, ""))
+    _patch_failing_session(monkeypatch, exc)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "gh": MCPServerConfig(
+                type="streamableHttp",
+                url="https://mcp.example.com/mcp",
+                headers={"Authorization": "Bearer WRONG"},
+            )
+        },
+        registry,
+    )
+
+    assert stacks == {}
+    assert registry.tool_names == []
+    assert mcp_mod._mcp_health.get_status_sync("gh")["connected"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _sdk_cancellation(),
+        BaseExceptionGroup(
+            "unhandled errors in a TaskGroup (1 sub-exception)",
+            [_sdk_cancellation()],
+        ),
+    ],
+    ids=["sdk-cancelled", "task-group"],
+)
+async def test_connect_mcp_servers_keeps_good_server_when_another_handshake_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """One server with a bad token must not prevent the others connecting —
+    this is the exact shape of the reported gateway crash."""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+
+    @asynccontextmanager
+    async def _fake_streamable_http_client(url: str, http_client=None):
+        yield ("bad" if "bad.example.com" in url else "good"), object(), None
+
+    monkeypatch.setattr(mcp_mod, "validate_url_target", lambda _u: (True, ""))
+    monkeypatch.setattr(mcp_mod, "_probe_http_url", _reachable)
+    monkeypatch.setattr(
+        sys.modules["mcp.client.streamable_http"],
+        "streamable_http_client",
+        _fake_streamable_http_client,
+    )
+    _patch_failing_session(
+        monkeypatch,
+        exc,
+        read="bad",
+        good_session=fake_mcp_runtime["session"],
+    )
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "bad": MCPServerConfig(
+                type="streamableHttp",
+                url="https://bad.example.com/mcp",
+                headers={"Authorization": "Bearer WRONG"},
+            ),
+            "good": MCPServerConfig(type="streamableHttp", url="https://good.example.com/mcp"),
+        },
+        registry,
+    )
+
+    assert sorted(stacks) == ["good"]
+    assert registry.tool_names == ["mcp_good_demo"]
+    assert mcp_mod._mcp_health.get_status_sync("bad")["connected"] is False
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_propagates_real_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine ``task.cancel()`` must still reach the caller: /stop and
+    shutdown rely on it.  Only the SDK's own cancel-scope leak is swallowed."""
+    monkeypatch.setattr(mcp_mod, "validate_url_target", lambda _u: (True, ""))
+    _patch_failing_session(monkeypatch, _external_cancellation())
+
+    registry = ToolRegistry()
+
+    task = asyncio.create_task(
+        connect_mcp_servers(
+            {"gh": MCPServerConfig(url="https://mcp.example.com/mcp")},
+            registry,
+        )
+    )
+    # The session must raise a bare CancelledError, as a real task.cancel() does.
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_is_mcp_sdk_cancellation_recognises_anyio_leak() -> None:
+    assert _is_mcp_sdk_cancellation(_sdk_cancellation()) is True
+    assert _is_mcp_sdk_cancellation(_external_cancellation()) is False
+    assert _is_mcp_sdk_cancellation(ValueError("nope")) is False
+    assert (
+        _is_mcp_sdk_cancellation(
+            BaseExceptionGroup("grp", [_external_cancellation(), RuntimeError("x")])
+        )
+        is False
+    )
+    assert (
+        _is_mcp_sdk_cancellation(
+            BaseExceptionGroup("grp", [RuntimeError("x"), _sdk_cancellation()])
+        )
+        is True
+    )
+    assert _is_mcp_sdk_cancellation(RuntimeError("plain error")) is False

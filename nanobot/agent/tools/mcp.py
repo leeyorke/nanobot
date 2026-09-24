@@ -222,6 +222,38 @@ def _is_session_terminated(exc: BaseException) -> bool:
     return any(marker in text for marker in _SESSION_TERMINATED_MARKERS)
 
 
+def _is_mcp_sdk_cancellation(exc: BaseException) -> bool:
+    """Return True when ``exc`` is the MCP SDK's own cancel-scope leak.
+
+    The MCP SDK runs its HTTP transports inside ``anyio.create_task_group()``.
+    When the server rejects the request (401/403/405, closed socket, ...) the
+    background reader task fails, anyio cancels its scope, and on teardown the
+    scope is exited from a *different* task.  What our calling coroutine sees
+    is a ``CancelledError`` whose message names the scope, or a
+    ``BaseExceptionGroup`` wrapping exactly such an error — never a real
+    cancellation we requested.  Both must be treated as "this server is not
+    usable" rather than "abort the whole turn".
+
+    A genuine external ``task.cancel()`` yields a ``CancelledError`` with an
+    *empty* message, so we return False for it and re-raise.
+    """
+    seen: set[int] = set()
+
+    def _walk(err: BaseException, depth: int) -> bool:
+        if depth > 4 or id(err) in seen:
+            return False
+        seen.add(id(err))
+        if isinstance(err, asyncio.CancelledError):
+            return "cancel scope" in str(err)
+        # ExceptionGroup / BaseExceptionGroup with any matching sub-exception
+        for sub in getattr(err, "exceptions", ()) or ():
+            if _walk(sub, depth + 1):
+                return True
+        return False
+
+    return _walk(exc, 0)
+
+
 async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
     """Quick TCP probe to check if an HTTP MCP server is reachable.
 
@@ -903,7 +935,34 @@ async def connect_mcp_servers(
 
             read = _filter_malformed_mcp_progress_notifications(read, name)
             session = await server_stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            try:
+                await session.initialize()
+            except BaseException as init_exc:
+                # ``initialize()`` can fail with ``CancelledError`` or a
+                # ``BaseExceptionGroup`` when the transport's internal anyio
+                # task group tears down on an HTTP error (e.g. 401 with a wrong
+                # token).  Both inherit from BaseException, so a plain
+                # ``except Exception`` never sees them and the original error
+                # was propagating all the way up into the agent loop.
+                # Swallow *only* the SDK's own cancel-scope leak
+                # (``CancelledError`` whose message names the scope, or a task
+                # group that blew up in its background reader).  A genuine
+                # external cancellation — /stop, shutdown — is re-raised so
+                # it reaches the task that asked for it.
+                if not _is_mcp_sdk_cancellation(init_exc):
+                    raise
+                logger.warning(
+                    "MCP server '{}': handshake failed ({}: {}); dropping this server. "
+                    "If the token in your config is wrong or expired, fix the "
+                    "Authorization header for this server — nanobot will retry later.",
+                    name,
+                    type(init_exc).__name__,
+                    str(init_exc)[:200] or "no detail",
+                )
+                await _mcp_health.mark_disconnected(name, "handshake failed")
+                with suppress(BaseException):
+                    await server_stack.aclose()
+                return name, None
 
             tools = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
@@ -998,7 +1057,7 @@ async def connect_mcp_servers(
                     "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
                 )
             logger.error("MCP server '{}': failed to connect: {}", name, hint)
-            with suppress(Exception):
+            with suppress(BaseException):
                 await server_stack.aclose()
             return name, None
 
@@ -1007,7 +1066,14 @@ async def connect_mcp_servers(
     for name, cfg in mcp_servers.items():
         try:
             result = await connect_single_server(name, cfg)
-        except Exception as e:
+        except BaseException as e:
+            # Never let a transport's BaseException (CancelledError leaking out
+            # of an anyio cancel scope, ExceptionGroup from a TaskGroup, ...)
+            # escape: it would take down the whole agent loop.  A failed server
+            # must only ever disable that one server.  A genuine external
+            # cancellation still propagates.
+            if isinstance(e, asyncio.CancelledError) and not _is_mcp_sdk_cancellation(e):
+                raise
             logger.error("MCP server '{}' connection failed: {}", name, e)
             continue
         if result is not None and result[1] is not None:
