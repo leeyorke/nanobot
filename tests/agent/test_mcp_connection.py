@@ -493,3 +493,166 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
     assert outputs == ["fresh:alpha", "fresh:beta"]
     assert connect_count == 2
     assert closed == ["remote"]
+
+
+# ---------------------------------------------------------------------------
+# _mcp_health_check: a leaked MCP-sdk cancel scope during the port probe must
+# not kill the agent loop.
+#
+# Reported shape: the gateway was shut down while the periodic health check was
+# inside ``_probe_http_url``. ``asyncio.wait_for`` re-surfaced the pending
+# cancellation as ``CancelledError("Cancelled via cancel scope ... by <Task>")``,
+# which passed through ``_mcp_health_check``'s ``except CancelledError: raise``
+# and escaped ``AgentLoop.run()``, crashing the process.
+# ---------------------------------------------------------------------------
+
+
+def _sdk_scope_cancellation() -> asyncio.CancelledError:
+    return asyncio.CancelledError(
+        "Cancelled via cancel scope 7ed5a4bec790 by "
+        "<Task pending name='nanobot-agent-loop' "
+        "coro=<AgentLoop.run() running at nanobot/agent/loop.py:1003>>"
+    )
+
+
+async def test_mcp_health_check_survives_probe_cancelled_by_stale_scope(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A probe aborted by a leftover cancel scope drops that server and keeps
+    the health check (and the loop) alive."""
+    loop = _make_loop(
+        tmp_path,
+        mcp_servers={"obsidian": MCPServerConfig(type="streamableHttp", url="http://172.17.224.1:27123/mcp/")},
+    )
+
+    async def _leaky_probe(_url, timeout=3.0):
+        raise _sdk_scope_cancellation()
+
+    monkeypatch.setattr("nanobot.agent.loop._probe_http_url", _leaky_probe)
+    closed: list[str] = []
+
+    async def _fake_close(state, name):
+        closed.append(name)
+
+    monkeypatch.setattr("nanobot.agent.loop._close_server", _fake_close)
+
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    loop._mcp_stacks["obsidian"] = stack
+
+    loop._last_mcp_health_check = 0.0
+    await loop._mcp_health_check()
+
+    assert closed == ["obsidian"]
+    assert mcp_runtime._mcp_health.get_status_sync("obsidian")["connected"] is False
+
+
+async def test_mcp_health_check_propagates_real_external_cancellation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A genuine ``task.cancel()`` must still abort the health check so gateway
+    shutdown and /stop keep working."""
+    loop = _make_loop(
+        tmp_path,
+        mcp_servers={
+            "obsidian": MCPServerConfig(type="streamableHttp", url="http://172.17.224.1:27123/mcp/")
+        },
+    )
+
+    async def _cancelled_probe(_url, timeout=3.0):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("nanobot.agent.loop._probe_http_url", _cancelled_probe)
+
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    loop._mcp_stacks["obsidian"] = stack
+    loop._last_mcp_health_check = 0.0
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop._mcp_health_check()
+
+    assert "obsidian" in loop._mcp_stacks
+
+
+async def test_mcp_health_check_warns_and_retries_when_server_stays_down(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A server that stays unreachable must produce a warning and stay retried,
+    never removing itself from the retry set."""
+    loop = _make_loop(
+        tmp_path,
+        mcp_servers={
+            "obsidian": MCPServerConfig(
+                type="streamableHttp", url="http://127.0.0.1:19997/mcp/"
+            )
+        },
+    )
+
+    async def _unreachable(_url, timeout=3.0):
+        return False
+
+    monkeypatch.setattr("nanobot.agent.loop._probe_http_url", _unreachable)
+    monkeypatch.setattr("nanobot.agent.loop._close_server", _fake_noop_close)
+
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    loop._mcp_stacks["obsidian"] = stack
+
+    loop._last_mcp_health_check = 0.0
+    await loop._mcp_health_check()
+
+    assert "obsidian" in loop._mcp_servers
+    assert mcp_runtime._mcp_health.get_status_sync("obsidian")["connected"] is False
+
+
+async def _fake_noop_close(_state, _name):
+    return None
+
+
+async def test_mcp_health_check_survives_cancelled_reconnect(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A reconnect interrupted by a stale cancel scope must be swallowed so the
+    loop retries on the next cycle instead of crashing the gateway."""
+    loop = _make_loop(
+        tmp_path,
+        mcp_servers={
+            "obsidian": MCPServerConfig(
+                type="streamableHttp", url="http://127.0.0.1:27123/mcp/"
+            )
+        },
+    )
+
+    async def _cancelled_connect(_state, _tools):
+        raise _sdk_scope_cancellation()
+
+    monkeypatch.setattr("nanobot.agent.loop.connect_missing_servers", _cancelled_connect)
+
+    loop._last_mcp_health_check = 0.0
+    # Must not raise.
+    await loop._mcp_health_check()
+
+    # Still configured, so the next health check retries it.
+    assert "obsidian" in loop._mcp_servers
+
+
+async def test_mcp_health_check_propagates_real_cancel_during_reconnect(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A genuine external cancellation during reconnect still aborts the loop."""
+    loop = _make_loop(
+        tmp_path,
+        mcp_servers={
+            "obsidian": MCPServerConfig(
+                type="streamableHttp", url="http://127.0.0.1:27123/mcp/"
+            )
+        },
+    )
+
+    async def _cancelled_connect(_state, _tools):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("nanobot.agent.loop.connect_missing_servers", _cancelled_connect)
+
+    loop._last_mcp_health_check = 0.0
+    with pytest.raises(asyncio.CancelledError):
+        await loop._mcp_health_check()

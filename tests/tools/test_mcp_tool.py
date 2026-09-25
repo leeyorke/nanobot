@@ -1312,3 +1312,67 @@ def test_is_mcp_sdk_cancellation_recognises_anyio_leak() -> None:
         is True
     )
     assert _is_mcp_sdk_cancellation(RuntimeError("plain error")) is False
+
+
+# ---------------------------------------------------------------------------
+# _run_mcp_isolated: a dead server's cancel-scope leak must stay in its task
+#
+# Regression test for the gateway crash reported when disabling MCP. anyio
+# delivers a scope's cancellation by calling task.cancel() on the task that
+# hosts it; when that was the agent loop's task the cancellation was
+# re-delivered on every later tick, so every subsequent await in
+# AgentLoop.run() raised again and the process died.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_mcp_isolated_absorbs_leaked_cancel_scope() -> None:
+    """A leaked anyio cancel scope must not leave the caller's task poisoned."""
+    leaked = _sdk_cancellation()
+
+    async def _leaky() -> None:
+        raise leaked
+
+    caller = asyncio.current_task()
+    result = await mcp_mod._run_mcp_isolated(_leaky())
+
+    assert result is None
+    assert caller is not None and caller.cancelling() == 0
+    # The caller must still be able to await normally.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.Queue().get(), timeout=0.1)
+
+
+async def test_run_mcp_isolated_lets_the_loop_keep_awaiting() -> None:
+    """Repeated leaked handshakes must not accumulate into a sticky cancel."""
+    main_task = asyncio.current_task()
+
+    async def _leaky() -> None:
+        raise asyncio.CancelledError("Cancelled via cancel scope deadbeef")
+
+    for _ in range(3):
+        assert await mcp_mod._run_mcp_isolated(_leaky()) is None
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.Queue().get(), timeout=0.1)
+    assert main_task is not None and main_task.cancelling() == 0
+
+
+async def test_run_mcp_isolated_reraises_real_external_cancellation() -> None:
+    """A genuine task.cancel() must still reach the caller (/stop, shutdown)."""
+
+    async def _hang() -> None:
+        await asyncio.sleep(30)
+
+    task = asyncio.create_task(mcp_mod._run_mcp_isolated(_hang()))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_run_mcp_isolated_reraises_ordinary_errors() -> None:
+    async def _boom() -> None:
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        await mcp_mod._run_mcp_isolated(_boom())

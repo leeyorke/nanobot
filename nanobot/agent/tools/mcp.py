@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shutil
+import sys
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
@@ -252,6 +253,46 @@ def _is_mcp_sdk_cancellation(exc: BaseException) -> bool:
         return False
 
     return _walk(exc, 0)
+
+
+_MCP_CONNECT_TIMEOUT = 20.0
+
+
+async def _run_mcp_isolated(coro: Awaitable[Any]) -> Any:
+    """Run one MCP connection attempt inside its own task.
+
+    The MCP SDK builds its transports on ``anyio`` task groups.  When a server
+    is unreachable or rejects the handshake, anyio tears its scope down by
+    calling ``task.cancel()`` on whatever task is hosting it — see
+    ``anyio/_backends/_asyncio.py`` ``_deliver_cancellation()``.  If that is the
+    *agent loop's* task, the cancellation is re-delivered on every later
+    ``call_soon`` tick and stays sticky, so a single dead server makes every
+    subsequent ``await`` in ``AgentLoop.run()`` raise again — which is exactly
+    what crashed the gateway.
+
+    Running each attempt in a throwaway task confines that cancellation to the
+    task that owns it.  The agent loop's task is never cancelled, so one dead
+    server can only ever fail itself.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.wait_for(task, timeout=_MCP_CONNECT_TIMEOUT)
+    except asyncio.CancelledError:
+        # Either a real external cancellation of *our* caller, or the disposable
+        # task's own leaked scope cancellation.  Distinguish them before
+        # deciding, then never leave the child task un-awaited.
+        if not _is_mcp_sdk_cancellation(sys.exc_info()[1]):
+            task.cancel()
+            with suppress(BaseException):
+                await task
+            raise
+        with suppress(BaseException):
+            await task
+        return None
+    except (Exception, BaseExceptionGroup) as exc:
+        with suppress(BaseException):
+            await task
+        raise exc
 
 
 async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
@@ -1065,15 +1106,17 @@ async def connect_mcp_servers(
 
     for name, cfg in mcp_servers.items():
         try:
-            result = await connect_single_server(name, cfg)
+            result = await _run_mcp_isolated(connect_single_server(name, cfg))
+        except asyncio.CancelledError:
+            # A genuine external cancellation (gateway shutdown, /stop) still
+            # propagates; the SDK's own scope leaks were already absorbed by
+            # ``_run_mcp_isolated``.
+            raise
         except BaseException as e:
             # Never let a transport's BaseException (CancelledError leaking out
             # of an anyio cancel scope, ExceptionGroup from a TaskGroup, ...)
             # escape: it would take down the whole agent loop.  A failed server
-            # must only ever disable that one server.  A genuine external
-            # cancellation still propagates.
-            if isinstance(e, asyncio.CancelledError) and not _is_mcp_sdk_cancellation(e):
-                raise
+            # must only ever disable that one server.
             logger.error("MCP server '{}' connection failed: {}", name, e)
             continue
         if result is not None and result[1] is not None:
@@ -1180,7 +1223,13 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
             else:
                 logger.warning("No MCP servers connected successfully (will retry next message)")
         except asyncio.CancelledError:
-            logger.warning("MCP connection cancelled (will retry next message)")
+            # A leftover MCP-sdk/anyio cancel scope must only fail this retry
+            # round: the agent loop keeps running and retries on the next
+            # health check. A genuine external cancellation still propagates.
+            if not _is_mcp_sdk_cancellation(sys.exc_info()[1]):
+                state._mcp_connected = bool(state._mcp_stacks)
+                raise
+            logger.debug("MCP connection attempt interrupted by a stale cancel scope")
             state._mcp_connected = bool(state._mcp_stacks)
         except BaseException as e:
             logger.warning("Failed to connect MCP servers (will retry next message): {}", e)

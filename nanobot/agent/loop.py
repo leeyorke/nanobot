@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import sys
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from nanobot.agent.tools.context import RequestContext, bind_request_context, re
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.mcp import (
     _close_server,
+    _is_mcp_sdk_cancellation,
     _mcp_health,
     _probe_http_url,
     _unregister_server_tools,
@@ -145,6 +147,12 @@ class TurnContext:
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
+
+
+# How often the loop probes configured MCP servers and retries the ones that
+# are down. Retrying every few minutes (rather than once at startup) lets a
+# server that comes back later reconnect on its own.
+_MCP_HEALTH_INTERVAL_SECONDS = 30.0
 
 
 class AgentLoop:
@@ -544,7 +552,7 @@ class AgentLoop:
         the main loop and crashes the gateway. Running inline avoids that.
         """
         now = time.monotonic()
-        if now - self._last_mcp_health_check < 30:
+        if now - self._last_mcp_health_check < _MCP_HEALTH_INTERVAL_SECONDS:
             return
         self._last_mcp_health_check = now
         try:
@@ -563,12 +571,29 @@ class AgentLoop:
                 )
                 if transport not in {"sse", "streamableHttp"}:
                     continue
-                if not await _probe_http_url(url, timeout=1.5):
+                try:
+                    reachable = await _probe_http_url(url, timeout=1.5)
+                except asyncio.CancelledError:
+                    # ``_probe_http_url`` wraps ``open_connection`` in
+                    # ``asyncio.wait_for``, whose teardown surfaces *any* pending
+                    # cancellation — including a leftover MCP-sdk/anyio cancel
+                    # scope — as ``CancelledError``. Treating that as "port gone"
+                    # keeps the agent loop alive; only a genuine external
+                    # cancellation (gateway shutdown, /stop) may abort the loop.
+                    if not _is_mcp_sdk_cancellation(sys.exc_info()[1]):
+                        raise
+                    logger.debug(
+                        "MCP server '{}': probe interrupted by a stale cancel scope",
+                        name,
+                    )
+                    reachable = False
+                if not reachable:
                     logger.warning(
-                        "MCP server '{}' port probe failed ({} unreachable); "
-                        "dropping stale connection",
+                        "MCP server '{}' disconnected (port probe failed: {} unreachable); "
+                        "will retry every {}s",
                         name,
                         url,
+                        int(_MCP_HEALTH_INTERVAL_SECONDS),
                     )
                     _unregister_server_tools(self, self.tools, name)
                     await _close_server(self, name)
@@ -585,9 +610,8 @@ class AgentLoop:
                 return
 
             if dead_servers:
-                logger.warning(
-                    "MCP health check: {} server(s) dropped due to port failure: {}",
-                    len(dead_servers),
+                logger.info(
+                    "MCP servers disconnected, will retry: {}",
                     sorted(dead_servers),
                 )
 
@@ -596,7 +620,21 @@ class AgentLoop:
                     "MCP health check: attempting to reconnect servers: {}",
                     sorted(missing.keys()),
                 )
-                await connect_missing_servers(self, self.tools)
+                try:
+                    await connect_missing_servers(self, self.tools)
+                except asyncio.CancelledError:
+                    # A leftover SDK cancel scope must not stop us from
+                    # retrying the other servers on the next cycle. A genuine
+                    # external cancellation still propagates.
+                    if not _is_mcp_sdk_cancellation(sys.exc_info()[1]):
+                        raise
+                    logger.debug("MCP reconnect interrupted by a stale cancel scope")
+                if not self._mcp_stacks:
+                    logger.warning(
+                        "MCP reconnection failed for {}, will retry in {}s",
+                        sorted(missing),
+                        int(_MCP_HEALTH_INTERVAL_SECONDS),
+                    )
 
         except asyncio.CancelledError:
             # Shutdown in progress; propagate.

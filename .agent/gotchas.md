@@ -46,3 +46,21 @@ When an MCP server rejects the handshake (401/403 from a wrong token, closed soc
 Guard the handshake in `agent/tools/mcp.py` with `_is_mcp_sdk_cancellation()` and only swallow that specific leak: an externally requested cancellation (`task.cancel()`) yields a `CancelledError` with an empty message and must be re-raised so `/stop` and shutdown still work.
 
 Do not add a pre-flight HTTP auth probe to detect a bad token early. It duplicates the `initialize` request the server receives and changes the observable request sequence covered by the SSRF/redirect tests in `tests/tools/test_mcp_tool.py`. Detect it once, at the handshake.
+
+## `CancelledError` Also Leaks Into the MCP Health Probe
+
+The same cancel-scope teardown can land in `AgentLoop._mcp_health_check()`. `_probe_http_url` wraps `open_connection` in `asyncio.wait_for`, and its teardown re-raises *any* pending cancellation — including a leftover MCP-sdk/anyio scope — as `CancelledError("Cancelled via cancel scope ... by <Task ...>")`. That escaped `run()`'s `except TimeoutError` branch and crashed the gateway during shutdown.
+
+So `except CancelledError: raise` is not automatically the right code. Discriminate with `_is_mcp_sdk_cancellation()` before deciding to propagate: a real `task.cancel()` yields an empty message and must still abort the loop, otherwise `/stop` and gateway shutdown stop working.
+
+Note that `loop.py` binds MCP helpers at import time (`from nanobot.agent.tools.mcp import _probe_http_url`), so tests must patch `nanobot.agent.loop._probe_http_url`, not the definition site.
+
+## MCP Work Must Run In Its Own Task
+
+This is the root cause behind the "disabling MCP still crashes" reports, and the fix is structural rather than a series of `except` clauses.
+
+anyio delivers a cancel scope's cancellation by calling `task.cancel()` on whatever task hosts it (`anyio/_backends/_asyncio.py` `_deliver_cancellation()`, re-scheduled via `call_soon`). When the MCP SDK's transport fails or the server rejects the handshake, the scope's host task is the **agent loop's** task — and the `uncancel()` compensation only runs on a clean scope exit, which a cross-task cleanup (`RuntimeError: Attempted to exit cancel scope in a different task`) never reaches. The cancellation is therefore sticky and re-delivered, so *every later* `await` in `AgentLoop.run()` raises again with the same scope id.
+
+Catching it is not enough: the exception being caught does not undo the `task.cancel()`.
+
+So all MCP connection work goes through `_run_mcp_isolated()` in `mcp.py`, which runs each server in a throwaway task. The leak dies with that task. Keep that pattern if you add new MCP calls into the loop — do not `await` an MCP coroutine directly from `AgentLoop.run()`.
